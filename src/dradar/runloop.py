@@ -20,8 +20,8 @@ from .api_client import ApiClient, ApiError
 from .identity import _client
 from .local_config import HOME, _load_config
 from .runner import (
-    RunnerError, check_task_content_hash, local_deep_swe_commit, run_trial,
-    summarize_result,
+    RunnerError, check_task_content_hash, ensure_pier, ensure_tasks_root,
+    local_deep_swe_commit, run_trial, summarize_result, sync_deep_swe_commit,
 )
 from .scrub import scan_secrets, scrub_file
 
@@ -88,15 +88,22 @@ def _check_version_pin(pinned: str | None, tasks_root: Path, allow_drift: bool) 
     way. The lease stays active across the exit."""
     local_commit = local_deep_swe_commit(tasks_root)
     if pinned and local_commit and local_commit != pinned:
+        # Self-heal: fetch + checkout the exact commit the server grades against,
+        # rather than making the volunteer do it by hand.
+        print(f"deep-swe drifted (local {local_commit[:12]} != server {pinned[:12]}); "
+              "syncing to the server's pinned commit...")
+        if sync_deep_swe_commit(tasks_root, pinned):
+            print(f"  synced to {pinned[:12]}")
+            return pinned
         fix = (
             f"  git -C {tasks_root} fetch --depth 1 origin {pinned}\n"
             f"  git -C {tasks_root} checkout {pinned}"
         )
         if not allow_drift:
             sys.exit(
-                "your deep-swe checkout does not match the version this server "
-                f"grades against:\n  local:  {local_commit}\n  server: {pinned}\n"
-                f"update it, then re-run (the lease stays active):\n{fix}\n"
+                "couldn't auto-sync your deep-swe checkout to the version this "
+                f"server grades against:\n  local:  {local_commit}\n  server: {pinned}\n"
+                f"do it by hand, then re-run (the lease stays active):\n{fix}\n"
                 "or re-run with --allow-task-drift to proceed anyway (the "
                 "submission will be flagged for review)"
             )
@@ -270,9 +277,19 @@ def cmd_go(args) -> int:
     cfg = _load_config()
     client = _client(cfg, auto_register=True)
     tasks_root = cfg.get("tasks_root")
-    if not tasks_root or not Path(tasks_root).is_dir():
+    if not tasks_root:
         sys.exit("tasks_root not configured; run: dradar login --tasks-root <deep-swe/tasks>")
-    tasks_root = Path(tasks_root)
+    tasks_root = Path(tasks_root).expanduser()
+
+    # Self-bootstrap the environment so a fresh machine needs far less manual
+    # setup: clone the (public) task repo if it's missing, install pier if it's
+    # missing. Docker + codex login still can't be auto-installed (privileges /
+    # credentials) -- `dradar doctor` guides those.
+    try:
+        ensure_tasks_root(tasks_root)
+        ensure_pier()
+    except RunnerError as exc:
+        sys.exit(str(exc))
 
     # Self-heal before anything else: a trial from a previous run that ran
     # but failed to upload must not just sit on disk forever.

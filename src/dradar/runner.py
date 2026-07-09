@@ -140,6 +140,65 @@ def local_deep_swe_commit(tasks_root: Path) -> str | None:
     return proc.stdout.strip() or None
 
 
+# The (public) task repo. Self-bootstrap clones it so a volunteer never has to.
+DEEP_SWE_REPO = "https://github.com/datacurve-ai/deep-swe"
+
+
+def ensure_pier() -> None:
+    """Auto-install pier if it's not on PATH -- one less manual prereq. Raises
+    RunnerError (not a silent skip) if it can't, so the volunteer sees why."""
+    if shutil.which("pier"):
+        return
+    uv = shutil.which("uv")
+    if not uv:
+        raise RunnerError(
+            "pier and uv are both missing -- install uv first: "
+            "curl -LsSf https://astral.sh/uv/install.sh | sh")
+    print("pier not found — installing it (one-time: uv tool install datacurve-pier)...")
+    proc = subprocess.run([uv, "tool", "install", "datacurve-pier"])
+    if proc.returncode != 0 or not shutil.which("pier"):
+        raise RunnerError(
+            "couldn't install pier automatically; run `uv tool install datacurve-pier` "
+            "yourself and make sure ~/.local/bin is on your PATH")
+
+
+def ensure_tasks_root(tasks_root: Path) -> None:
+    """Auto-clone the public deep-swe task repo if the configured tasks_root
+    doesn't exist yet (magic-command convention: tasks_root is <repo>/tasks), so
+    a fresh volunteer doesn't have to clone it by hand. No-op if it's already
+    there; bails quietly if the path doesn't fit the convention (leave it to
+    the user rather than clobber something)."""
+    if tasks_root.is_dir():
+        return
+    if tasks_root.name != "tasks":
+        raise RunnerError(
+            f"tasks_root {tasks_root} doesn't exist and doesn't look like a "
+            f"deep-swe/tasks path; clone {DEEP_SWE_REPO} and point --tasks-root at its tasks/")
+    repo_dir = tasks_root.parent
+    if repo_dir.exists() and any(repo_dir.iterdir()):
+        raise RunnerError(
+            f"{repo_dir} exists but has no tasks/ dir; not touching it — "
+            f"make sure it's a clean {DEEP_SWE_REPO} checkout")
+    print(f"deep-swe task repo not found; cloning {DEEP_SWE_REPO} → {repo_dir} (one-time)...")
+    proc = subprocess.run(["git", "clone", DEEP_SWE_REPO, str(repo_dir)])
+    if proc.returncode != 0 or not tasks_root.is_dir():
+        raise RunnerError(f"failed to clone deep-swe into {repo_dir}")
+    print(f"  cloned; tasks at {tasks_root}")
+
+
+def sync_deep_swe_commit(tasks_root: Path, pinned: str) -> bool:
+    """Fetch + checkout the exact commit the server grades against, so a drifted
+    checkout self-heals instead of hard-failing. Returns True on success."""
+    for cmd in (["git", "-C", str(tasks_root), "fetch", "--depth", "1", "origin", pinned],
+                ["git", "-C", str(tasks_root), "checkout", pinned]):
+        try:
+            if subprocess.run(cmd, capture_output=True, text=True, timeout=120).returncode != 0:
+                return False
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    return local_deep_swe_commit(tasks_root) == pinned
+
+
 def check_task_content_hash(assignment: dict, tasks_root: Path) -> bool | None:
     """Compare the server's task_content_hash against this volunteer's local
     checkout. Returns None when the assignment carries no hash to compare

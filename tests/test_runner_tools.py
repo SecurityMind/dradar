@@ -39,3 +39,72 @@ def test_claude_code_disallows_web_tools(tmp_path, monkeypatch):
                              tmp_path, tmp_path / "jobs", "j", tmp_path / "home")
     assert f"disallowed_tools={CLAUDE_DISALLOWED_TOOLS}" in cmd
     assert "WebSearch" in CLAUDE_DISALLOWED_TOOLS and "WebFetch" in CLAUDE_DISALLOWED_TOOLS
+
+
+# --- self-bootstrap (ensure_pier / ensure_tasks_root) ------------------------
+import subprocess
+from pathlib import Path
+
+import pytest
+from dradar.runner import RunnerError, ensure_pier, ensure_tasks_root
+
+
+def test_ensure_pier_noop_when_present(monkeypatch):
+    monkeypatch.setattr(runner_mod.shutil, "which", lambda n: "/usr/bin/pier")
+    called = []
+    monkeypatch.setattr(runner_mod.subprocess, "run", lambda *a, **k: called.append(a))
+    ensure_pier()
+    assert called == []            # already there -> never shells out
+
+
+def test_ensure_pier_installs_via_uv_when_missing(monkeypatch):
+    seen = {"pier": None}  # pier missing first, present after "install"
+    def which(name):
+        if name == "uv":
+            return "/usr/bin/uv"
+        return seen["pier"]
+    monkeypatch.setattr(runner_mod.shutil, "which", which)
+    def fake_run(cmd, *a, **k):
+        assert cmd == ["/usr/bin/uv", "tool", "install", "datacurve-pier"]
+        seen["pier"] = "/root/.local/bin/pier"   # simulate the install landing
+        return subprocess.CompletedProcess(cmd, 0)
+    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
+    ensure_pier()                  # should not raise
+
+
+def test_ensure_pier_errors_when_no_uv(monkeypatch):
+    monkeypatch.setattr(runner_mod.shutil, "which", lambda n: None)
+    with pytest.raises(RunnerError, match="uv"):
+        ensure_pier()
+
+
+def test_ensure_tasks_root_noop_when_present(tmp_path, monkeypatch):
+    tr = tmp_path / "deep-swe" / "tasks"
+    tr.mkdir(parents=True)
+    monkeypatch.setattr(runner_mod.subprocess, "run",
+                        lambda *a, **k: pytest.fail("should not clone"))
+    ensure_tasks_root(tr)          # exists -> no clone
+
+
+def test_ensure_tasks_root_rejects_non_tasks_path(tmp_path):
+    with pytest.raises(RunnerError, match="deep-swe/tasks"):
+        ensure_tasks_root(tmp_path / "somewhere" / "else")
+
+
+def test_ensure_tasks_root_wont_clobber_nonempty_parent(tmp_path):
+    repo = tmp_path / "deep-swe"
+    repo.mkdir()
+    (repo / "junk").write_text("x")   # parent exists, non-empty, no tasks/
+    with pytest.raises(RunnerError, match="not touching"):
+        ensure_tasks_root(repo / "tasks")
+
+
+def test_ensure_tasks_root_clones_when_missing(tmp_path, monkeypatch):
+    tr = tmp_path / "deep-swe" / "tasks"
+    def fake_run(cmd, *a, **k):
+        assert cmd[0] == "git" and cmd[1] == "clone"
+        (tr).mkdir(parents=True)   # simulate the clone creating tasks/
+        return subprocess.CompletedProcess(cmd, 0)
+    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
+    ensure_tasks_root(tr)
+    assert tr.is_dir()
