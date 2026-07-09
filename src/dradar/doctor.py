@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import __version__
+from . import __version__, runner
 from .identity import _client
 from .local_config import _load_config
 
@@ -100,29 +100,50 @@ def cmd_doctor(args) -> int:
         compose = _probe([docker, "compose", "version"])
         all_ok &= _check("docker compose plugin", compose, hints["compose"])
 
+    # pier is auto-installed on `dradar go`; do it here too so doctor reflects
+    # the ready state instead of a scary FAIL a volunteer (or an agent following
+    # a runbook) then chases with the wrong fix.
+    try:
+        runner.ensure_pier()
+    except runner.RunnerError:
+        pass
     all_ok &= _check("pier", bool(shutil.which("pier")), "uv tool install datacurve-pier")
 
+    # Agent: you only need ONE family working. If the one you're set up for is
+    # ready, say so and stay quiet about the other -- don't print a FAIL for
+    # claude when you use codex (that false alarm is what sends an agent down a
+    # rabbit hole). Only nag about specifics when NEITHER is ready.
     codex = shutil.which("codex")
-    codex_ok = _check("codex CLI", bool(codex), _CODEX_HINTS[plat])
     auth = Path(os.environ.get("CODEX_AUTH_JSON_PATH", Path.home() / ".codex" / "auth.json"))
-    codex_auth_ok = _check("codex auth.json", auth.is_file(), "run: codex login")
+    codex_ready = bool(codex) and auth.is_file()
+    claude_ready = bool(shutil.which("claude")) and bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
+    if codex_ready:
+        _check("codex — agent ready", True)
+    elif claude_ready:
+        _check("claude — agent ready", True)
+    else:
+        _check("codex CLI", bool(codex), _CODEX_HINTS[plat])
+        _check("codex auth.json", auth.is_file(), "run: codex login")
+        _check("claude CLI (alternative to codex)", bool(shutil.which("claude")),
+               "npm install -g @anthropic-ai/claude-code")
+        _check("CLAUDE_CODE_OAUTH_TOKEN (alternative to codex)",
+               bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")),
+               "or: claude setup-token, then export CLAUDE_CODE_OAUTH_TOKEN each shell")
+    all_ok &= (codex_ready or claude_ready)
 
-    claude = shutil.which("claude")
-    claude_ok = _check("claude CLI", bool(claude), "npm install -g @anthropic-ai/claude-code")
-    claude_token_ok = _check(
-        "CLAUDE_CODE_OAUTH_TOKEN", bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")),
-        "run: claude setup-token, then export CLAUDE_CODE_OAUTH_TOKEN before dradar go "
-        "(this is a per-session env var, unlike codex's auth.json file — re-export it in "
-        "every new shell)",
-    )
-    # Volunteers only need ONE agent family fully working; don't fail doctor
-    # just because the other one isn't configured, but still show both blocks.
-    all_ok &= (codex_ok and codex_auth_ok) or (claude_ok and claude_token_ok)
-
+    # The task repo is auto-cloned on `dradar go`; do it here too so a missing
+    # checkout reports OK instead of a FAIL whose hint doesn't actually fix it.
     tasks_root = cfg.get("tasks_root")
+    if tasks_root and not Path(tasks_root).expanduser().is_dir():
+        try:
+            runner.ensure_tasks_root(Path(tasks_root).expanduser())
+        except runner.RunnerError:
+            pass
     all_ok &= _check(
-        "tasks_root configured", bool(tasks_root and Path(tasks_root).is_dir()),
-        "dradar login --tasks-root /path/to/deep-swe/tasks",
+        "tasks_root",
+        bool(tasks_root and Path(tasks_root).expanduser().is_dir()),
+        "run `dradar go` once — it auto-clones the task repo" if tasks_root
+        else "dradar login --tasks-root /path/to/deep-swe/tasks",
     )
 
     free_gb = shutil.disk_usage(Path.home()).free / 1e9
