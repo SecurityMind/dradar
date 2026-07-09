@@ -2,10 +2,10 @@
 
 This is the same mechanism the quota-radar pipeline uses: initialize with
 experimentalApi, then account/rateLimits/read. It returns the ACCOUNT's true
-5h and weekly windows (used percent + exact reset instants) — strictly better
-than dradar's own-usage ledger, which stays as the fallback since this API is
-experimental and may move between codex versions. Every caller must tolerate
-None.
+5h and weekly windows (used percent + exact reset instants). This API is
+experimental and may move between codex versions, so every caller must
+tolerate None (no local fallback exists — quota is the volunteer's own to
+track; see runloop._go_menu).
 """
 
 import json

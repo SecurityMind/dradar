@@ -1,19 +1,21 @@
 """The run loop: `dradar go` / `dradar resume`.
 
-Bundle-mode (tier + budget -> a packed work list, serial run+upload, live
-quota-probe sleep/resume) with a menu-mode fallback for servers that predate
-bundle dispatch. Split out of cli.py to separate this from identity
-(login/register) and doctor (environment checks) concerns.
+Menu-mode: claim one task at a time, run it, upload. Quota is the
+volunteer's own to manage — dradar shows the server's per-task estimate
+(minutes + % of a 5h window) and lets them decide whether to proceed; if a
+run doesn't finish in time, the lease simply expires and the cell reopens
+for someone else, with nothing counted. Split out of cli.py to separate
+this from identity (login/register) and doctor (environment checks)
+concerns.
 """
 
 import json
 import shutil
 import sys
 import tempfile
-import time
 from pathlib import Path
 
-from . import __version__, limits, pending, quota
+from . import __version__, limits, pending
 from .api_client import ApiClient, ApiError
 from .identity import _client
 from .local_config import HOME, _load_config
@@ -201,11 +203,6 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         return "failed"
     probe_after = None if args.dev_agent else limits.read_rate_limits()
 
-    # The window fraction was spent regardless of outcome — record it so the
-    # next pre-flight guard sees this run's footprint. Real agent runs only.
-    if not args.dev_agent:
-        quota.record_run(HOME, assignment.get("est_quota_pct"))
-
     stats = summarize_result(art.result)
     # An interrupted/failed run (nonzero pier rc or recorded exception) is not a
     # model failure: report it so the server marks it invalid, not graded 0.
@@ -288,54 +285,6 @@ def cmd_retry_upload(args) -> int:
     return 0
 
 
-_QUOTA_MARGIN = 1.5      # est x margin must fit in the remaining window
-_WEEKLY_STOP_PCT = 95    # refuse to start new items near the weekly wall
-
-
-def _quota_sleep_loop(est_pct: float | None) -> bool:
-    """Sleep until there is room for this item; False = skip it entirely.
-
-    Prefers the account's REAL windows (codex app-server probe: exact used
-    percent + reset instants, including the weekly limit the ledger can't
-    see). Falls back to dradar's own-usage ledger when the probe fails."""
-    while True:
-        rl = limits.read_rate_limits()
-        if rl:
-            weekly = rl.get("weekly_used_pct")
-            if weekly is not None and weekly >= _WEEKLY_STOP_PCT:
-                reset = rl.get("weekly_resets_at")
-                when = time.strftime("%m-%d %H:%M", time.localtime(reset)) if reset else "?"
-                print(f"  quota guard: your WEEKLY window is {weekly}% used — "
-                      f"stopping here (resets ~{when}; `dradar resume` then)")
-                return False
-            used = rl["five_hour_used_pct"]
-            need = (est_pct or 0) * _QUOTA_MARGIN
-            if need > 100:
-                print("  quota guard: this task alone would exceed a full 5h window — skipping it")
-                return False
-            if used + need <= 100:
-                return True
-            reset = rl.get("five_hour_resets_at")
-            wait = max(60.0, (reset - time.time()) + 120) if reset else 900.0
-            until = time.strftime("%H:%M", time.localtime(time.time() + wait))
-            print(f"  quota guard: 5h window {used}% used (live reading), this task "
-                  f"needs ~{need:.0f}% — sleeping until ~{until} "
-                  f"(Ctrl+C to stop, `dradar resume` continues later)")
-            time.sleep(wait)
-            continue
-        # probe unavailable: dradar's own-usage ledger (floor, not the truth)
-        wait = quota.seconds_until_fits(HOME, est_pct)
-        if wait == 0:
-            return True
-        if wait < 0:
-            print("  quota guard: this task alone would exceed a full 5h window — skipping it")
-            return False
-        until = time.strftime("%H:%M", time.localtime(time.time() + wait))
-        print(f"  quota guard: window nearly full (ledger estimate) — sleeping until ~{until} "
-              f"({wait/60:.0f} min; Ctrl+C to stop, `dradar resume` continues later)")
-        time.sleep(wait)
-
-
 def cmd_go(args) -> int:
     cfg = _load_config()
     client = _client(cfg, auto_register=True)
@@ -386,13 +335,10 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
     local_commit = _check_version_pin(assignment.get("deep_swe_commit"), tasks_root,
                                       args.allow_task_drift)
 
-    if not args.dev_agent:
-        ok, msg = quota.check(HOME, assignment.get("est_quota_pct"))
-        if msg:
-            print(msg)
-        if not ok:
-            print("not started (the lease stays active; `dradar resume` after your window resets)")
-            return 1
+    if not args.dev_agent and assignment.get("est_quota_pct"):
+        print("  it's your call whether you have room for this — dradar doesn't track "
+              "your subscription usage. If you don't finish before the lease expires, "
+              "the cell just reopens for someone else and nothing is counted.")
 
     if not args.yes:
         answer = input("run it now? [y/N] ").strip().lower()
@@ -404,7 +350,7 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
     return 0 if outcome in ("submitted", "interrupted") else 1
 
 
-__all__ = ["cmd_go", "_go_menu", "_quota_sleep_loop",
+__all__ = ["cmd_go", "_go_menu",
            "_run_and_submit", "_check_version_pin", "_claim_from_menu",
            "_choose_menu_entry", "_print_menu", "_print_assignment",
            "cmd_retry_upload", "_retry_pending_uploads", "_upload_trial",

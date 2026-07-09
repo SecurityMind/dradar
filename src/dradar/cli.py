@@ -28,7 +28,7 @@ from .identity import (
 from .local_config import CONFIG_PATH, HOME, _load_config, _save_config
 from .runloop import (
     _check_version_pin, _choose_menu_entry, _claim_from_menu, _print_assignment,
-    _print_menu, _quota_sleep_loop, _run_and_submit,
+    _print_menu, _run_and_submit,
     _go_menu, cmd_go, cmd_retry_upload,
 )
 
