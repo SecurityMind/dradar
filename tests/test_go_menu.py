@@ -77,5 +77,43 @@ def test_declining_the_prompt_never_blocks_or_errors(monkeypatch, capsys, tmp_pa
     rc = runloop._go_menu(_args(yes=False, dev_agent=None), {}, client, tmp_path)
     out = capsys.readouterr().out
     assert "it's your call" in out  # still shown before the prompt
-    assert "aborted (lease stays active" in out
+    assert "aborted" in out and "stay active" in out
     assert rc == 1
+
+
+def test_runs_the_whole_held_batch_serially(monkeypatch, capsys, tmp_path: Path):
+    """Free-pick: `active` carries several claimed cells -> the loop runs each
+    one, in order, with a single get_assignment call (no re-claim per cell)."""
+    ran = []
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: None)
+    monkeypatch.setattr(runloop, "_run_and_submit",
+                        lambda client, a, *rest: ran.append(a["assignment_id"]) or "submitted")
+    batch = [{**ASSIGNMENT, "assignment_id": f"a{i}", "task_id": f"t{i}"} for i in range(1, 4)]
+    client = FakeClient({"active": batch, "free_pick": True, "menu": None})
+    rc = runloop._go_menu(_args(yes=True, dev_agent=None), {}, client, tmp_path)
+    assert ran == ["a1", "a2", "a3"]       # all three, claim order
+    assert "holding 3 cells" in capsys.readouterr().out
+    assert rc == 0
+
+
+def test_free_pick_with_no_held_cells_points_to_the_web(monkeypatch, capsys, tmp_path: Path):
+    _patch_run(monkeypatch)
+    client = FakeClient({"active": [], "free_pick": True, "menu": None})
+    rc = runloop._go_menu(_args(yes=True, dev_agent=None), {}, client, tmp_path)
+    out = capsys.readouterr().out
+    assert "pick some on the radar page" in out
+    assert rc == 0
+
+
+def test_skip_in_a_batch_moves_to_the_next_cell(monkeypatch, capsys, tmp_path: Path):
+    ran = []
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: None)
+    monkeypatch.setattr(runloop, "_run_and_submit",
+                        lambda client, a, *rest: ran.append(a["assignment_id"]) or "submitted")
+    # 's' skips cell 1, 'y' runs cell 2
+    answers = iter(["s", "y"])
+    monkeypatch.setattr("builtins.input", lambda *_: next(answers))
+    batch = [{**ASSIGNMENT, "assignment_id": "a1"}, {**ASSIGNMENT, "assignment_id": "a2"}]
+    client = FakeClient({"active": batch, "free_pick": True, "menu": None})
+    runloop._go_menu(_args(yes=False, dev_agent=None), {}, client, tmp_path)
+    assert ran == ["a2"]                    # a1 skipped, a2 ran

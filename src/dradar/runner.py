@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .manifest import task_content_hash
-from .resume_agent import MAX_RESUMES, _MAX_WAIT_SEC
 
 # The egress allowlist alone does NOT stop the agent from searching the web:
 # codex/Claude web tools execute server-side (at OpenAI/Anthropic), riding the
@@ -58,16 +57,6 @@ def _ensure_allowlist(home: Path) -> Path:
     return path
 
 
-# The smaller of the two values every deep-swe task.toml declares for
-# [agent] timeout_sec (the other is 5400). pier's own --agent-timeout-
-# multiplier multiplies whichever base the ACTUAL task happens to declare —
-# dividing by the smallest possible base (below) when deriving a multiplier
-# guarantees the result is large enough regardless of which base a given
-# task really has (it only ever over-shoots for 5400s-base tasks, which has
-# no real cost — see build_pier_command's docstring).
-_MIN_TASK_AGENT_TIMEOUT_SEC = 1800
-
-
 def build_pier_command(
     assignment: dict,
     tasks_root: Path,
@@ -75,14 +64,7 @@ def build_pier_command(
     job_name: str,
     home: Path,
     dev_agent: str | None = None,
-    resilient_timeout_sec: int | None = None,
 ) -> list[str]:
-    """resilient_timeout_sec: this run's OWN outer subprocess.run timeout
-    (only meaningful on the resilient-codex path) -- required so pier's
-    inner --agent-timeout-multiplier can be derived to guarantee pier's own
-    watchdog never fires before dradar's outer one does, for THIS specific
-    run's actual timeout, rather than trusting a fixed constant to happen to
-    be large enough for every est_minutes/task combination."""
     pier = shutil.which("pier")
     if not pier:
         raise RunnerError("pier not found on PATH (run: uv tool install datacurve-pier)")
@@ -91,35 +73,7 @@ def build_pier_command(
         raise RunnerError(f"task not found locally: {task_path}")
 
     agent = dev_agent or assignment["agent"]
-    if agent == "codex" and not dev_agent:
-        # Quota-resilient wrapper: same pier codex driver, but a mid-task
-        # rate-limit pauses and resumes the session instead of dying (see
-        # dradar/resume_agent.py). Import path resolves inside pier's venv
-        # via the PYTHONPATH the runner injects.
-        #
-        # pier enforces its OWN agent wall-clock ceiling independently of
-        # this process's subprocess.run timeout (asyncio.wait_for around the
-        # whole agent.run() coroutine -> AgentTimeoutError) — every deep-swe
-        # task.toml sets [agent] timeout_sec to 1800 or 5400. A resume sleep
-        # can run up to MAX_RESUMES x 6h; without raising pier's own ceiling
-        # too, pier kills the trial (and the sleeping resume coroutine with
-        # it) long before a real multi-hour rate-limit window resets, and the
-        # sleep-and-resume mechanism never actually gets to resume anything.
-        # The multiplier is DERIVED from this run's own outer timeout (see
-        # run_trial) rather than a fixed guess: a fixed constant can be too
-        # SMALL for some est_minutes (pier's inner ceiling ends up shorter
-        # than dradar's own outer one, so pier still fires first defeating
-        # the fix) or needlessly huge for others. Deriving it against the
-        # smallest possible task base guarantees pier's inner ceiling is
-        # always >= this run's outer one, so dradar's own subprocess.run
-        # timeout below remains the true, GUARANTEED ceiling in every case.
-        multiplier = 30
-        if resilient_timeout_sec:
-            multiplier = max(1, -(-int(resilient_timeout_sec) // _MIN_TASK_AGENT_TIMEOUT_SEC))
-        agent_args = ["--agent-import-path", "dradar.resume_agent:QuotaResilientCodex",
-                     "--agent-timeout-multiplier", str(multiplier)]
-    else:
-        agent_args = ["--agent", agent]
+    agent_args = ["--agent", agent]
     cmd = [
         pier, "run",
         "-p", str(task_path),
@@ -219,29 +173,16 @@ def run_trial(
         job_name = f"{job_name}-{int(time.time())}"
 
     log_path = work_dir / f"{job_name}.log"
-    # Cap the run so a wedged docker/agent can't hang the CLI past the lease.
+    # Cap the run so a wedged docker/agent can't hang the CLI forever.
     # Generous multiple of the estimate (+ a floor for image pull/build).
+    # A mid-task rate-limit death just ends the run (no sleep-and-resume) --
+    # it surfaces as a nonzero pier rc, which _run_and_submit reports as
+    # `interrupted` -> the server marks it invalid and the cell reopens.
     est_min = assignment.get("est_minutes") or 30
     timeout_sec = max(1800, int(est_min) * 60 * 4)
-    resilient = not dev_agent and (assignment.get("agent") == "codex")
-    if resilient:
-        # Worst case the resilient agent can legitimately need: every resume
-        # attempt hits the window wall again (MAX_RESUMES x up to
-        # _MAX_WAIT_SEC of sleep), PLUS real working time across the initial
-        # attempt and each resume (bounded generously by the larger observed
-        # per-task agent timeout, 5400s, x (MAX_RESUMES+1) attempts). This
-        # value also drives pier's own inner timeout multiplier below, so
-        # dradar's own subprocess.run timeout stays the guaranteed ceiling.
-        timeout_sec += MAX_RESUMES * _MAX_WAIT_SEC + (MAX_RESUMES + 1) * 5400
 
-    cmd = build_pier_command(assignment, tasks_root, jobs_dir, job_name, work_dir, dev_agent,
-                             resilient_timeout_sec=timeout_sec if resilient else None)
+    cmd = build_pier_command(assignment, tasks_root, jobs_dir, job_name, work_dir, dev_agent)
     env = dict(os.environ)
-    if resilient:
-        import dradar
-        pkg_parent = str(Path(dradar.__file__).resolve().parent.parent)
-        env["PYTHONPATH"] = (pkg_parent + os.pathsep + env["PYTHONPATH"]
-                             if env.get("PYTHONPATH") else pkg_parent)
     if on_started is not None:
         # Best-effort by design: this only confirms to the server that a
         # free-pick claim's short initial lease should be extended (see

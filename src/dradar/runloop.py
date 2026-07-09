@@ -1,21 +1,21 @@
 """The run loop: `dradar go` / `dradar resume`.
 
-Menu-mode: claim one task at a time, run it, upload. Quota is the
-volunteer's own to manage — dradar shows the server's per-task estimate
-(minutes + % of a 5h window) and lets them decide whether to proceed; if a
-run doesn't finish in time, the lease simply expires and the cell reopens
-for someone else, with nothing counted. Split out of cli.py to separate
-this from identity (login/register) and doctor (environment checks)
-concerns.
+Runs the volunteer's held batch of cells serially — free-pick instances let
+them claim up to a handful at once on the web, and the CLI works through
+them one at a time. Menu-mode instances (no web claim) still claim a single
+task from the menu. Quota is the volunteer's own to manage — dradar shows
+the server's per-task estimate and lets them decide whether to proceed; if a
+run doesn't finish before its lease expires, the cell just reopens for
+someone else with nothing counted. Split out of cli.py to separate this from
+identity (login/register) and doctor (environment checks) concerns.
 """
 
-import json
 import shutil
 import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, limits, pending
+from . import __version__, pending
 from .api_client import ApiClient, ApiError
 from .identity import _client
 from .local_config import HOME, _load_config
@@ -190,9 +190,6 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     never exits, so a bundle loop can carry on with the next item."""
     hash_match = check_task_content_hash(assignment, tasks_root)
     work_dir = HOME / "work"
-    # Real before/after readings turn every volunteer run into a price-tag
-    # calibration sample (the server-side refresh consumes these deltas).
-    probe_before = None if args.dev_agent else limits.read_rate_limits()
     print("running trial (this can take a while)...")
     try:
         art = run_trial(
@@ -201,7 +198,6 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     except RunnerError as exc:
         print(f"trial failed: {exc}")
         return "failed"
-    probe_after = None if args.dev_agent else limits.read_rate_limits()
 
     stats = summarize_result(art.result)
     # An interrupted/failed run (nonzero pier rc or recorded exception) is not a
@@ -220,21 +216,6 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "deep_swe_commit": local_commit,
         **stats,
     }
-    if probe_before and probe_after:
-        meta["quota_probe"] = {
-            "five_hour_before_pct": probe_before["five_hour_used_pct"],
-            "five_hour_after_pct": probe_after["five_hour_used_pct"],
-            "weekly_after_pct": probe_after.get("weekly_used_pct"),
-            "plan_type": probe_after.get("plan_type"),
-        }
-    pauses_file = art.trial_dir / "agent" / "quota_pauses.json"
-    if pauses_file.is_file():
-        try:
-            meta["quota_pauses"] = json.loads(pauses_file.read_text())["pauses"]
-            print(f"  (this trial paused {len(meta['quota_pauses'])}x for window "
-                  "resets — recorded transparently)")
-        except (json.JSONDecodeError, KeyError, OSError):
-            pass
 
     return _upload_trial(
         client, assignment["assignment_id"], assignment["nonce"], assignment["task_id"],
@@ -301,53 +282,74 @@ def cmd_go(args) -> int:
 
 
 def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
-    """The run flow: resume an active lease, or claim one task at a time from
-    the menu and run it. Bundle (multi-task auto-packing) dispatch was
-    retired server-side; this is the only flow now, not a fallback."""
+    """Run the volunteer's held batch of cells serially. On a free-pick
+    instance the batch is whatever they claimed on the web (up to the server's
+    concurrent cap); on a menu-mode instance it's a single cell claimed from
+    the menu here. Bundle (multi-task auto-packing) dispatch was retired
+    server-side; this is the only flow now."""
     resume = getattr(args, "resume", False)
     try:
         data = client.get_assignment()
     except ApiError as exc:
         sys.exit(str(exc))
-    assignment = data.get("assignment")
+    # New server returns the whole held batch as `active`; fall back to the
+    # older single-`assignment` shape so an older server still works.
+    active = data.get("active")
+    if active is None:
+        one = data.get("assignment")
+        active = [one] if one else []
+    free_pick = data.get("free_pick", False)
     menu = data.get("menu")
-    resumed = data.get("resumed", False)
-    if not assignment and resume:
-        print("nothing to resume — no active lease (it may have expired). Run `dradar go`.")
-        return 0
-    if not assignment and menu:
+
+    # Menu mode (non-free-pick, e.g. claude): nothing held -> claim one now.
+    if not active and not free_pick and menu:
         try:
             claimed = _claim_from_menu(client, menu, args.yes)
         except ApiError as exc:
             sys.exit(str(exc))
-        assignment = claimed.get("assignment")
-        resumed = claimed.get("resumed", False)
-    if not assignment:
-        print("no work available right now — thank you, check back later")
-        return 0
-    if resume and not resumed:
-        print("no active lease to resume; run `dradar go` to take new work")
-        return 0
-    if resumed:
-        print("resuming active assignment:")
+        one = claimed.get("assignment")
+        active = [one] if one else []
 
-    _print_assignment(assignment)
-    local_commit = _check_version_pin(assignment.get("deep_swe_commit"), tasks_root,
+    if not active:
+        if free_pick:
+            print("no cells claimed — pick some on the radar page, then paste the "
+                  "command it gives you (or run `dradar go` again after claiming).")
+        elif resume:
+            print("nothing to resume — no active lease (it may have expired). Run `dradar go`.")
+        else:
+            print("no work available right now — thank you, check back later")
+        return 0
+
+    # One local checkout serves the whole batch, so the version pin only needs
+    # checking once (it sys.exit's on a mismatch unless --allow-task-drift).
+    local_commit = _check_version_pin(active[0].get("deep_swe_commit"), tasks_root,
                                       args.allow_task_drift)
 
-    if not args.dev_agent and assignment.get("est_quota_pct"):
-        print("  it's your call whether you have room for this — dradar doesn't track "
-              "your subscription usage. If you don't finish before the lease expires, "
-              "the cell just reopens for someone else and nothing is counted.")
-
-    if not args.yes:
-        answer = input("run it now? [y/N] ").strip().lower()
-        if answer != "y":
-            print("aborted (lease stays active; `dradar resume` to continue)")
-            return 1
-
-    outcome = _run_and_submit(client, assignment, tasks_root, args, local_commit)
-    return 0 if outcome in ("submitted", "interrupted") else 1
+    n = len(active)
+    if n > 1:
+        print(f"you're holding {n} cells — running them one at a time "
+              "(Ctrl-C anytime; unrun cells auto-release):")
+    results = []
+    for i, assignment in enumerate(active, 1):
+        if n > 1:
+            print(f"\n=== cell {i}/{n} ===")
+        _print_assignment(assignment)
+        if not args.dev_agent and assignment.get("est_quota_pct"):
+            print("  it's your call whether you have room for this — dradar doesn't track "
+                  "your subscription usage. If you don't finish before the lease expires, "
+                  "the cell just reopens for someone else and nothing is counted.")
+        if not args.yes:
+            prompt = "run it now? [y/N]" + (" (or 's' to skip this one)" if n > 1 else "") + " "
+            answer = input(prompt).strip().lower()
+            if n > 1 and answer == "s":
+                print("skipped (its lease stays active; `dradar resume` to come back to it)")
+                continue
+            if answer != "y":
+                print("aborted (any remaining leases stay active; `dradar resume` to continue)")
+                return 1
+        results.append(_run_and_submit(client, assignment, tasks_root, args, local_commit))
+    ok = all(o in ("submitted", "interrupted") for o in results)
+    return 0 if ok else 1
 
 
 __all__ = ["cmd_go", "_go_menu",

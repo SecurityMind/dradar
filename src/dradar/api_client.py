@@ -85,12 +85,14 @@ class ApiClient:
         return self._get("/api/v1/whoami")
 
     def get_assignment(self) -> dict[str, Any]:
-        """Returns {assignment: dict|None, resumed: bool, menu: list|None}."""
+        """Returns {active: [dict, ...], free_pick: bool, menu: list|None, ...}
+        — `active` is the whole held batch to run, in claim order. Also carries
+        legacy `assignment`/`resumed` (first active lease) for older clients."""
         return self._get("/api/v1/assignment")
 
     def claim_assignment(self, task_id: str, model: str, effort: str) -> dict[str, Any]:
         """Returns {assignment: dict, resumed: False}. Raises ApiError (409) if
-        the cell went stale or the volunteer already holds an active lease."""
+        the cell went stale or the volunteer is already at the concurrent cap."""
         resp = self._request(
             "POST", "/api/v1/assignment/claim",
             data={"task_id": task_id, "model": model, "effort": effort},
