@@ -341,19 +341,16 @@ def cmd_go(args) -> int:
     return _go_menu(args, cfg, client, tasks_root)
 
 
-def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
-    """Run the volunteer's held batch of cells serially. On a free-pick
-    instance the batch is whatever they claimed on the web (up to the server's
-    concurrent cap); on a menu-mode instance it's a single cell claimed from
-    the menu here. Bundle (multi-task auto-packing) dispatch was retired
-    server-side; this is the only flow now."""
-    resume = getattr(args, "resume", False)
+def _acquire_batch(client: ApiClient, yes: bool) -> tuple[list[dict], bool]:
+    """The volunteer's held batch, plus whether this is a free-pick instance.
+    Free-pick: the batch is whatever they claimed on the web. Menu mode
+    (non-free-pick, e.g. claude) with nothing held: claim one from the menu
+    right here. Normalizes the older single-`assignment` payload shape so an
+    older server still works."""
     try:
         data = client.get_assignment()
     except ApiError as exc:
         _exit_for(exc)
-    # New server returns the whole held batch as `active`; fall back to the
-    # older single-`assignment` shape so an older server still works.
     active = data.get("active")
     if active is None:
         one = data.get("assignment")
@@ -361,26 +358,19 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
     free_pick = data.get("free_pick", False)
     menu = data.get("menu")
 
-    # Menu mode (non-free-pick, e.g. claude): nothing held -> claim one now.
     if not active and not free_pick and menu:
         try:
-            one = _claim_from_menu(client, menu, args.yes)
+            one = _claim_from_menu(client, menu, yes)
         except ApiError as exc:
             _exit_for(exc)
         active = [one] if one else []
+    return active, free_pick
 
-    if not active:
-        if free_pick:
-            print("no cells claimed — pick some on the radar page, then paste the "
-                  "command it gives you (or run `dradar go` again after claiming).")
-        elif resume:
-            print("nothing to resume — no active lease (it may have expired). Run `dradar go`.")
-        else:
-            print("no work available right now — thank you, check back later")
-        return 0
 
-    # One local checkout serves the whole batch, so the version pin only needs
-    # checking once (it sys.exit's on a mismatch unless --allow-task-drift).
+def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict]) -> int:
+    """Run a non-empty held batch serially: one version-pin check covers the
+    whole batch (a single local checkout serves every cell; it sys.exit's on
+    a mismatch unless --allow-task-drift), then per-cell confirm/skip/run."""
     local_commit = _check_version_pin(active[0].get("deep_swe_commit"), tasks_root,
                                       args.allow_task_drift)
 
@@ -409,6 +399,23 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
         results.append(_run_and_submit(client, assignment, tasks_root, args, local_commit))
     ok = all(o in ("submitted", "interrupted") for o in results)
     return 0 if ok else 1
+
+
+def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
+    """Run the volunteer's held batch of cells serially: acquire the batch
+    (web-claimed on free-pick instances, menu-claimed otherwise), explain an
+    empty one, hand a non-empty one to _run_batch."""
+    active, free_pick = _acquire_batch(client, args.yes)
+    if not active:
+        if free_pick:
+            print("no cells claimed — pick some on the radar page, then paste the "
+                  "command it gives you (or run `dradar go` again after claiming).")
+        elif getattr(args, "resume", False):
+            print("nothing to resume — no active lease (it may have expired). Run `dradar go`.")
+        else:
+            print("no work available right now — thank you, check back later")
+        return 0
+    return _run_batch(args, client, tasks_root, active)
 
 
 __all__ = ["cmd_go", "_go_menu",

@@ -59,6 +59,9 @@ class ApiClient:
     def _get(self, path: str) -> dict[str, Any]:
         return self._check(self._request("GET", path))
 
+    def _post(self, path: str, **kw) -> dict[str, Any]:
+        return self._check(self._request("POST", path, **kw))
+
     def _request(self, method: str, path: str, **kw) -> httpx.Response:
         try:
             return self._client.request(method, path, **kw)
@@ -79,12 +82,10 @@ class ApiClient:
 
     def register(self, nickname: str) -> dict[str, Any]:
         """Self-serve signup; returns {nickname, token}. No auth required."""
-        resp = self._request("POST", "/api/v1/register", data={"nickname": nickname})
-        return self._check(resp)
+        return self._post("/api/v1/register", data={"nickname": nickname})
 
     def rename(self, nickname: str) -> dict[str, Any]:
-        resp = self._request("POST", "/api/v1/rename", data={"nickname": nickname})
-        return self._check(resp)
+        return self._post("/api/v1/rename", data={"nickname": nickname})
 
     def my_submissions(self) -> dict[str, Any]:
         """Returns {nickname, points, submissions: [...]} — the volunteer's
@@ -96,14 +97,10 @@ class ApiClient:
         return self._get("/api/v1/github/config")
 
     def github_link(self, access_token: str) -> dict[str, Any]:
-        resp = self._request("POST", "/api/v1/github/link",
-                             data={"access_token": access_token})
-        return self._check(resp)
+        return self._post("/api/v1/github/link", data={"access_token": access_token})
 
     def github_whoami(self, access_token: str) -> dict[str, Any]:
-        resp = self._request("POST", "/api/v1/github/whoami",
-                             data={"access_token": access_token})
-        return self._check(resp)
+        return self._post("/api/v1/github/whoami", data={"access_token": access_token})
 
     def whoami(self) -> dict[str, Any]:
         return self._get("/api/v1/whoami")
@@ -117,11 +114,10 @@ class ApiClient:
     def claim_assignment(self, task_id: str, model: str, effort: str) -> dict[str, Any]:
         """Returns {assignment: dict, resumed: False}. Raises ApiError (409) if
         the cell went stale or the volunteer is already at the concurrent cap."""
-        resp = self._request(
-            "POST", "/api/v1/assignment/claim",
+        return self._post(
+            "/api/v1/assignment/claim",
             data={"task_id": task_id, "model": model, "effort": effort},
         )
-        return self._check(resp)
 
     def mark_started(self, assignment_id: str) -> dict[str, Any]:
         """Confirms the trial subprocess actually started (see runner.run_trial):
@@ -130,11 +126,10 @@ class ApiClient:
         rather than let a heartbeat failure abort a real trial. 404 on
         servers that predate this endpoint or on a menu-style lease
         that never had a short window to extend in the first place."""
-        resp = self._request(
-            "POST", "/api/v1/assignment/started",
+        return self._post(
+            "/api/v1/assignment/started",
             data={"assignment_id": assignment_id},
         )
-        return self._check(resp)
 
     def submit(
         self,
@@ -153,8 +148,8 @@ class ApiClient:
             files.append(("trajectory", ("trajectory.json", trajectory.read_bytes())))
         if result and result.exists():
             files.append(("result", ("result.json", result.read_bytes())))
-        resp = self._request(
-            "POST", "/api/v1/submissions",
+        return self._post(
+            "/api/v1/submissions",
             data={
                 "assignment_id": assignment_id,
                 "nonce": nonce,
@@ -163,4 +158,3 @@ class ApiClient:
             },
             files=files,
         )
-        return self._check(resp)
