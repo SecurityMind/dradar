@@ -30,7 +30,10 @@ def _print_assignment(a: dict) -> None:
     print(f"assignment {a['assignment_id']}: {a['task_id']}")
     print(f"  model={a['model']} effort={a['effort']} agent={a['agent']}")
     if a.get("est_minutes"):
-        print(f"  estimated: ~{a['est_minutes']} min, ~{a.get('est_quota_pct', '?')}% of a 5h window")
+        # Denominated in the weekly window: Codex removed the 5h rolling
+        # limit (2026-07), the 7d quota is the only constraint left.
+        print(f"  estimated: ~{a['est_minutes']} min, "
+              f"~{a.get('est_quota_pct', '?')}% of a weekly (7d) quota window")
     print(f"  lease expires: {a['expires_at']}")
 
 
