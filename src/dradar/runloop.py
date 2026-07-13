@@ -22,6 +22,7 @@ from .local_config import HOME, _load_config
 from .runner import (
     RunnerError, check_task_content_hash, ensure_pier, ensure_tasks_root,
     local_deep_swe_commit, run_trial, summarize_result, sync_deep_swe_commit,
+    trial_artifact_paths,
 )
 from .scrub import scan_secrets, scrub_file
 
@@ -45,45 +46,68 @@ def _print_menu(menu: list[dict]) -> None:
 
 def _choose_menu_entry(menu: list[dict], yes: bool) -> dict:
     """Pick an entry from a non-empty menu. Non-interactive (-y) always takes
-    the first (hungriest) pick with zero prompting, to keep automation stable."""
+    the first (hungriest) pick with zero prompting, to keep automation stable.
+    Empty input takes the top pick. Invalid input gets one announced re-prompt
+    (the claim leases the cell immediately, so a silent fallback would point
+    the volunteer's quota at a task they never chose), then falls back to the
+    top pick so garbage-piping automation still terminates."""
     if yes:
         return menu[0]
     _print_menu(menu)
-    raw = input(f"pick a task 1 to {len(menu)}, or press enter for the top pick: ").strip()
-    if not raw:
-        return menu[0]
-    try:
-        idx = int(raw)
-    except ValueError:
-        return menu[0]
-    if idx < 1 or idx > len(menu):
-        return menu[0]
-    return menu[idx - 1]
+    for attempt in range(2):
+        raw = input(f"pick a task 1 to {len(menu)}, or press enter for the top pick: ").strip()
+        if not raw:
+            return menu[0]
+        try:
+            idx = int(raw)
+        except ValueError:
+            idx = 0
+        if 1 <= idx <= len(menu):
+            return menu[idx - 1]
+        if attempt == 0:
+            print(f"invalid choice '{raw}'")
+    print(f"taking the top pick ({menu[0]['task_id']})")
+    return menu[0]
 
 
-def _claim_from_menu(client: ApiClient, menu: list[dict], yes: bool) -> dict:
+def _claim_from_menu(client: ApiClient, menu: list[dict], yes: bool) -> dict | None:
     """Claim a menu entry, retrying once with a fresh menu if it went stale.
-    Returns {assignment: dict|None, resumed: bool} — 'resumed' is True when a
-    409 turned out to mean "you already hold an active lease" (self-heal via
-    get_assignment) rather than "the cell filled up", so the caller can tell
-    a pre-existing lease apart from a fresh claim."""
+    Returns the claimed assignment (or an already-held one, when a 409 meant
+    "you already hold an active lease" and get_assignment self-heals), or
+    None when no work is available."""
     for attempt in range(2):
         choice = _choose_menu_entry(menu, yes)
         try:
             data = client.claim_assignment(choice["task_id"], choice["model"], choice["effort"])
-            return {"assignment": data.get("assignment"), "resumed": False}
+            return data.get("assignment")
         except ApiError as exc:
             if exc.status_code != 409:
                 raise
             if attempt == 1:
                 print("no work available right now — thank you, check back later")
-                return {"assignment": None, "resumed": False}
+                return None
             print(f"that cell went stale ({exc}); fetching a fresh menu...")
             retry = client.get_assignment()
             menu = retry.get("menu")
             if not menu:
-                return {"assignment": retry.get("assignment"), "resumed": retry.get("resumed", False)}
-    return {"assignment": None, "resumed": False}
+                return retry.get("assignment")
+    return None
+
+
+def _exit_for(exc: ApiError) -> None:
+    """Exit on a dead-end ApiError in the run flow with a next step, not just
+    the raw server error. 401 means the token was reset/clobbered — recoverable
+    without support. status_code None means the request never reached the
+    server (DNS/connect/timeout), so any held leases are untouched. Everything
+    else (e.g. 403 account suspended) carries the server's own explanation
+    verbatim."""
+    if exc.status_code == 401:
+        sys.exit(f"{exc}\nyour token was rejected — `dradar login --github` recovers a "
+                 "linked identity, otherwise grab a fresh token on the radar page")
+    if exc.status_code is None:
+        sys.exit(f"{exc}\ncheck your connection — held leases stay active, and "
+                 "`dradar resume` continues where you left off")
+    sys.exit(str(exc))
 
 
 def _check_version_pin(pinned: str | None, tasks_root: Path, allow_drift: bool) -> str | None:
@@ -117,29 +141,39 @@ def _check_version_pin(pinned: str | None, tasks_root: Path, allow_drift: bool) 
     return local_commit
 
 
-def _artifacts_from_trial_dir(trial_dir: Path) -> tuple[Path, Path | None, Path | None]:
-    """Reconstruct (patch, trajectory, result) paths from a trial_dir, mirroring
-    runner.run_trial's layout — used by retry, where no live TrialArtifacts
-    object exists (the process that ran the trial already exited)."""
-    patch = trial_dir / "artifacts" / "model.patch"
-    trajectory = trial_dir / "agent" / "trajectory.json"
-    result = trial_dir / "result.json"
-    return patch, (trajectory if trajectory.is_file() else None), (result if result.is_file() else None)
+# The trial-dir artifact layout is owned by runner (pier writes it); retry
+# reconstructs paths from a bare trial_dir via the same single source of truth.
+_artifacts_from_trial_dir = trial_artifact_paths
 
 
-def _upload_trial(client: ApiClient, assignment_id: str, nonce: str, task_id: str,
-                  patch: Path, trajectory: Path | None, result: Path | None,
-                  meta: dict, outcome: str, job_dir: Path | None, keep: bool) -> str:
-    """Scrub + upload one trial's artifacts. Shared by the normal post-run
-    path and by `dradar retry-upload` (which reconstructs the same arguments
-    from the pending-upload ledger instead of a fresh TrialArtifacts).
-    Never exits — returns an outcome tag so callers (a bundle loop, a retry
-    scan) can carry on with the next item.
+def _upload_trial(client: ApiClient, entry: dict) -> str:
+    """Scrub + upload one trial's artifacts, described by a pending-ledger
+    entry dict (assignment_id/nonce/task_id/trial_dir/meta/outcome/job_dir/
+    keep) — the same shape the ledger round-trips, so what persists on failure
+    is identical by construction to what was attempted. Shared by the normal
+    post-run path and by `dradar retry-upload` (which passes loaded ledger
+    entries straight through). Never exits — returns an outcome tag so
+    callers (the held-batch loop, a retry scan) can carry on with the next
+    item.
 
-    On upload failure the caller's entry stays (or is freshly added) in the
-    local pending-upload ledger — the raw trial_dir is never touched by
-    scrubbing (which writes to a fresh tempdir), so a later retry re-scrubs
-    from the same untouched originals."""
+    The entry is recorded in the local pending-upload ledger BEFORE the
+    submit attempt, so a process death mid-upload (Ctrl-C/kill/OOM during a
+    large multipart POST) can't orphan a completed, quota-burning trial.
+    Every exit settles it: success/409/410 remove the entry, anything else
+    keeps it for retry. The raw trial_dir is never touched by scrubbing
+    (which writes to a fresh tempdir), so a later retry re-scrubs from the
+    same untouched originals."""
+    assignment_id = entry["assignment_id"]
+    task_id = entry.get("task_id", "?")
+    outcome = entry.get("outcome", "completed")
+    job_dir = Path(entry["job_dir"]) if entry.get("job_dir") else None
+
+    patch, trajectory, result = trial_artifact_paths(Path(entry["trial_dir"]))
+    if not patch.is_file():
+        print(f"  {task_id}: local artifacts are gone, giving up on this one")
+        pending.remove(HOME, assignment_id)
+        return "artifacts-gone"
+
     leaked = scan_secrets(patch.read_bytes())
     if leaked:
         print(f"patch contains secret-shaped content ({', '.join(sorted(set(leaked)))}); "
@@ -159,9 +193,13 @@ def _upload_trial(client: ApiClient, assignment_id: str, nonce: str, task_id: st
         if result:
             result_scrubbed = scrubbed / "result.json"
             scrub_file(result, result_scrubbed)
+        # Record before submitting: from here on an unacked completed trial
+        # always has a ledger entry, whatever kills the upload. The server
+        # dedupes replays (409 "already submitted"), so duplicates are safe.
+        pending.record(HOME, entry)
         try:
-            ack = client.submit(assignment_id, nonce, patch, traj_scrubbed,
-                                result_scrubbed, meta, outcome=outcome)
+            ack = client.submit(assignment_id, entry["nonce"], patch, traj_scrubbed,
+                                result_scrubbed, entry["meta"], outcome=outcome)
         except ApiError as exc:
             if exc.status_code == 409:
                 # Some earlier attempt actually landed server-side even
@@ -176,11 +214,6 @@ def _upload_trial(client: ApiClient, assignment_id: str, nonce: str, task_id: st
                 return "expired"
             print(f"  {task_id}: upload failed ({exc}) — kept for retry "
                   "(`dradar retry-upload`)")
-            pending.record(HOME, {
-                "assignment_id": assignment_id, "nonce": nonce, "task_id": task_id,
-                "trial_dir": str(patch.parent.parent), "meta": meta, "outcome": outcome,
-                "job_dir": str(job_dir) if job_dir else None, "keep": keep,
-            })
             return "upload-failed"
 
     pending.remove(HOME, assignment_id)
@@ -189,7 +222,7 @@ def _upload_trial(client: ApiClient, assignment_id: str, nonce: str, task_id: st
               "the cell stays open for a fresh run once your quota resets")
     else:
         print(f"submitted: {ack['submission_id']} (grading happens server-side)")
-    if job_dir and not keep:
+    if job_dir and not entry.get("keep", False):
         shutil.rmtree(job_dir, ignore_errors=True)
     return "interrupted" if outcome == "interrupted" else "submitted"
 
@@ -197,7 +230,7 @@ def _upload_trial(client: ApiClient, assignment_id: str, nonce: str, task_id: st
 def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     args, local_commit: str | None) -> str:
     """Run one assignment and upload the artifacts. Returns an outcome tag —
-    never exits, so a bundle loop can carry on with the next item."""
+    never exits, so the held-batch loop can carry on with the next item."""
     hash_match = check_task_content_hash(assignment, tasks_root)
     work_dir = HOME / "work"
     print("running trial (this can take a while)...")
@@ -227,10 +260,12 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         **stats,
     }
 
-    return _upload_trial(
-        client, assignment["assignment_id"], assignment["nonce"], assignment["task_id"],
-        art.patch, art.trajectory, art.result, meta, outcome, art.job_dir, args.keep,
-    )
+    return _upload_trial(client, {
+        "assignment_id": assignment["assignment_id"], "nonce": assignment["nonce"],
+        "task_id": assignment["task_id"], "trial_dir": str(art.trial_dir),
+        "meta": meta, "outcome": outcome,
+        "job_dir": str(art.job_dir) if art.job_dir else None, "keep": args.keep,
+    })
 
 
 def _retry_pending_uploads(client: ApiClient) -> None:
@@ -243,16 +278,8 @@ def _retry_pending_uploads(client: ApiClient) -> None:
         return
     print(f"retrying {len(entries)} upload(s) left over from a previous run...")
     for e in entries:
-        patch, trajectory, result = _artifacts_from_trial_dir(Path(e["trial_dir"]))
-        if not patch.is_file():
-            print(f"  {e.get('task_id', '?')}: local artifacts are gone, giving up on this one")
-            pending.remove(HOME, e["assignment_id"])
-            continue
-        _upload_trial(
-            client, e["assignment_id"], e["nonce"], e.get("task_id", "?"),
-            patch, trajectory, result, e["meta"], e.get("outcome", "completed"),
-            Path(e["job_dir"]) if e.get("job_dir") else None, keep=e.get("keep", False),
-        )
+        # _upload_trial handles the gone-artifacts case (drops the entry).
+        _upload_trial(client, e)
     print()
 
 
@@ -311,7 +338,7 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
     try:
         data = client.get_assignment()
     except ApiError as exc:
-        sys.exit(str(exc))
+        _exit_for(exc)
     # New server returns the whole held batch as `active`; fall back to the
     # older single-`assignment` shape so an older server still works.
     active = data.get("active")
@@ -324,10 +351,9 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
     # Menu mode (non-free-pick, e.g. claude): nothing held -> claim one now.
     if not active and not free_pick and menu:
         try:
-            claimed = _claim_from_menu(client, menu, args.yes)
+            one = _claim_from_menu(client, menu, args.yes)
         except ApiError as exc:
-            sys.exit(str(exc))
-        one = claimed.get("assignment")
+            _exit_for(exc)
         active = [one] if one else []
 
     if not active:

@@ -51,6 +51,19 @@ class RunnerError(RuntimeError):
     pass
 
 
+def codex_auth_path() -> Path:
+    """Where codex keeps its auth (CODEX_AUTH_JSON_PATH overrides the default).
+    Shared with doctor so its "agent ready" verdict tests the exact condition
+    `dradar go` enforces."""
+    return Path(os.environ.get("CODEX_AUTH_JSON_PATH", Path.home() / ".codex" / "auth.json"))
+
+
+def claude_oauth_token() -> str | None:
+    """The Claude Code readiness signal — same sharing rationale as
+    codex_auth_path()."""
+    return os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+
+
 def _ensure_allowlist(home: Path) -> Path:
     path = home / "codex-chatgpt-allowlist.toml"
     path.write_text(ALLOWLIST_TOML)
@@ -86,7 +99,7 @@ def build_pier_command(
         "--yes",
     ]
     if agent == "codex":
-        auth = Path(os.environ.get("CODEX_AUTH_JSON_PATH", Path.home() / ".codex" / "auth.json"))
+        auth = codex_auth_path()
         if not auth.is_file():
             raise RunnerError(f"codex auth not found: {auth} (run `codex login` first)")
         allowlist = _ensure_allowlist(home)
@@ -97,7 +110,7 @@ def build_pier_command(
             "--ae", f"CODEX_AUTH_JSON_PATH={auth}",
         ]
     elif agent == "claude-code":
-        oauth_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        oauth_token = claude_oauth_token()
         if not oauth_token:
             raise RunnerError(
                 "CLAUDE_CODE_OAUTH_TOKEN not set (run: claude setup-token, "
@@ -122,6 +135,19 @@ def locate_artifacts(jobs_dir: Path, job_name: str) -> tuple[Path, Path]:
     if not trials:
         raise RunnerError(f"no trial dir under {job_dir}")
     return job_dir, trials[0]
+
+
+def trial_artifact_paths(trial_dir: Path) -> tuple[Path, Path | None, Path | None]:
+    """The (patch, trajectory, result) paths inside a trial_dir — the single
+    source of truth for pier's artifact layout. Used by run_trial right after
+    a run, and by the retry-upload path, which reconstructs the paths from a
+    bare trial_dir long after the process that ran the trial exited. The
+    optional files are None when absent; the patch path is returned either
+    way (callers decide whether a missing patch is fatal)."""
+    patch = trial_dir / "artifacts" / "model.patch"
+    trajectory = trial_dir / "agent" / "trajectory.json"
+    result = trial_dir / "result.json"
+    return patch, (trajectory if trajectory.is_file() else None), (result if result.is_file() else None)
 
 
 def local_deep_swe_commit(tasks_root: Path) -> str | None:
@@ -217,6 +243,26 @@ def check_task_content_hash(assignment: dict, tasks_root: Path) -> bool | None:
     return match
 
 
+def _tail(log_path: Path, n: int = 15) -> str:
+    """Last n lines of the pier log, for inlining into trial-failure messages:
+    after a 30-120 min run the actual cause (docker pull failure, auth
+    rejection, rate-limit death) sits at the end of that log, and just naming
+    the file makes the volunteer go hunt for it. Local-terminal only — never
+    uploaded — so no scrub concern."""
+    try:
+        lines = log_path.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(lines[-n:])
+
+
+def _trial_timeout_sec(assignment: dict) -> int:
+    """Cap for one trial: a generous multiple of the server's estimate, with
+    a floor for image pull/build."""
+    est_min = assignment.get("est_minutes") or 30
+    return max(1800, int(est_min) * 60 * 4)
+
+
 def run_trial(
     assignment: dict,
     tasks_root: Path,
@@ -233,12 +279,10 @@ def run_trial(
 
     log_path = work_dir / f"{job_name}.log"
     # Cap the run so a wedged docker/agent can't hang the CLI forever.
-    # Generous multiple of the estimate (+ a floor for image pull/build).
     # A mid-task rate-limit death just ends the run (no sleep-and-resume) --
     # it surfaces as a nonzero pier rc, which _run_and_submit reports as
     # `interrupted` -> the server marks it invalid and the cell reopens.
-    est_min = assignment.get("est_minutes") or 30
-    timeout_sec = max(1800, int(est_min) * 60 * 4)
+    timeout_sec = _trial_timeout_sec(assignment)
 
     cmd = build_pier_command(assignment, tasks_root, jobs_dir, job_name, work_dir, dev_agent)
     env = dict(os.environ)
@@ -259,26 +303,27 @@ def run_trial(
             proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
                                   cwd=work_dir, env=env, timeout=timeout_sec)
         except subprocess.TimeoutExpired as exc:
+            log.flush()
             raise RunnerError(
                 f"trial exceeded {timeout_sec // 60} min and was aborted "
-                f"(see {log_path}); docker/agent likely wedged"
+                f"(see {log_path}); docker/agent likely wedged\n"
+                f"last lines of the log:\n{_tail(log_path)}"
             ) from exc
     duration = time.time() - started
 
     job_dir, trial_dir = locate_artifacts(jobs_dir, job_name)
-    patch = trial_dir / "artifacts" / "model.patch"
+    patch, trajectory, result = trial_artifact_paths(trial_dir)
     if not patch.is_file():
         raise RunnerError(
-            f"model.patch missing (agent likely failed; see {log_path} and {trial_dir})"
+            f"model.patch missing (agent likely failed; see {log_path} and {trial_dir})\n"
+            f"last lines of the log:\n{_tail(log_path)}"
         )
-    trajectory = trial_dir / "agent" / "trajectory.json"
-    result = trial_dir / "result.json"
     return TrialArtifacts(
         job_dir=job_dir,
         trial_dir=trial_dir,
         patch=patch,
-        trajectory=trajectory if trajectory.is_file() else None,
-        result=result if result.is_file() else None,
+        trajectory=trajectory,
+        result=result,
         returncode=proc.returncode,
         duration_sec=duration,
         log_path=log_path,

@@ -1,10 +1,20 @@
 """HTTP client for the dradar dispatch server."""
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+
+def _env_proxies_set() -> bool:
+    """Any of the proxy env vars httpx honors. Passing ANY explicit transport
+    to httpx.Client disables its environment-proxy mounting entirely, so the
+    connect-retry transport below must stand aside on proxied machines."""
+    return any(os.environ.get(k) for k in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy"))
 
 
 class ApiError(RuntimeError):
@@ -19,17 +29,31 @@ class ApiError(RuntimeError):
 
 
 class ApiClient:
-    def __init__(self, server: str, token: str):
+    def __init__(self, server: str, token: str,
+                 transport: httpx.BaseTransport | None = None):
         self.server = server.rstrip("/")
         # write=None: large uploads over a slow tunnel must not hit a write
         # timeout; keep a bounded connect/read so a dead server fails fast.
         # No header at all when tokenless (pre-registration): an empty
         # "Bearer " is an illegal header value.
+        # transport is a test seam (httpx.MockTransport); when none is
+        # injected, default to connect-phase retries: httpx re-attempts only
+        # failed connection ESTABLISHMENT (DNS blip, refused/reset before the
+        # request is sent) and never re-sends a request whose bytes went out,
+        # so this is safe for the POST claim/submit endpoints (no duplicate
+        # side effects). EXCEPT on proxied machines: httpx mounts
+        # HTTP(S)_PROXY/ALL_PROXY only when no explicit transport is passed,
+        # so there we keep httpx's default transport (proxy correctness
+        # beats a connect-retry nicety — a good chunk of the volunteer pool
+        # reaches the server only through a proxy).
         headers = {"Authorization": f"Bearer {token}"} if token else {}
+        if transport is None and not _env_proxies_set():
+            transport = httpx.HTTPTransport(retries=2)
         self._client = httpx.Client(
             base_url=self.server,
             headers=headers,
             timeout=httpx.Timeout(30.0, write=None, read=120.0),
+            transport=transport,
         )
 
     def _get(self, path: str) -> dict[str, Any]:
@@ -104,7 +128,7 @@ class ApiClient:
         extends a free-pick claim's short initial lease out to the normal
         window. Best-effort by design — callers should swallow ApiError
         rather than let a heartbeat failure abort a real trial. 404 on
-        servers that predate this endpoint or on a menu/bundle-style lease
+        servers that predate this endpoint or on a menu-style lease
         that never had a short window to extend in the first place."""
         resp = self._request(
             "POST", "/api/v1/assignment/started",

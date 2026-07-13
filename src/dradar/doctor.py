@@ -2,7 +2,6 @@
 per-platform fix hints, and a live server-login probe.
 """
 
-import os
 import shutil
 import subprocess
 import sys
@@ -114,9 +113,9 @@ def cmd_doctor(args) -> int:
     # claude when you use codex (that false alarm is what sends an agent down a
     # rabbit hole). Only nag about specifics when NEITHER is ready.
     codex = shutil.which("codex")
-    auth = Path(os.environ.get("CODEX_AUTH_JSON_PATH", Path.home() / ".codex" / "auth.json"))
+    auth = runner.codex_auth_path()
     codex_ready = bool(codex) and auth.is_file()
-    claude_ready = bool(shutil.which("claude")) and bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
+    claude_ready = bool(shutil.which("claude")) and bool(runner.claude_oauth_token())
     if codex_ready:
         _check("codex — agent ready", True)
     elif claude_ready:
@@ -127,7 +126,7 @@ def cmd_doctor(args) -> int:
         _check("claude CLI (alternative to codex)", bool(shutil.which("claude")),
                "npm install -g @anthropic-ai/claude-code")
         _check("CLAUDE_CODE_OAUTH_TOKEN (alternative to codex)",
-               bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")),
+               bool(runner.claude_oauth_token()),
                "or: claude setup-token, then export CLAUDE_CODE_OAUTH_TOKEN each shell")
     all_ok &= (codex_ready or claude_ready)
 

@@ -4,7 +4,7 @@ rename / link-github.
 The actual command implementations live in sibling modules, split by concern:
   identity.py  - login/register/rename/GitHub device-flow binding
   doctor.py    - environment preflight checks
-  runloop.py   - the go/resume bundle-and-menu execution loop
+  runloop.py   - the go/resume held-batch-and-menu execution loop
   local_config.py - the shared ~/.dradar/config.json + constants
 
 This file re-exports their public names (so `dradar.cli.whatever` keeps
@@ -22,7 +22,7 @@ from .doctor import (
     _CODEX_HINTS, _DOCKER_HINTS, _check, _probe, _platform, cmd_doctor,
 )
 from .identity import (
-    TIERS, _auto_register, _client, _github_device_token, cmd_link_github,
+    _auto_register, _client, _github_device_token, cmd_link_github,
     cmd_login, cmd_rename, cmd_status,
 )
 from .local_config import CONFIG_PATH, HOME, _load_config, _save_config
@@ -33,7 +33,7 @@ from .runloop import (
 )
 
 __all__ = [
-    "ApiClient", "ApiError", "HOME", "CONFIG_PATH", "TIERS",
+    "ApiClient", "ApiError", "HOME", "CONFIG_PATH",
     "cmd_login", "cmd_rename", "cmd_link_github", "cmd_doctor", "cmd_go",
     "cmd_retry_upload", "main",
 ]
@@ -49,7 +49,6 @@ def main(argv: list[str] | None = None) -> int:
     p_login.add_argument("--token")
     p_login.add_argument("--nickname", help="register a new account instead of using a token")
     p_login.add_argument("--tasks-root", help="path to deep-swe/tasks checkout")
-    p_login.add_argument("--tier", choices=TIERS, help="subscription tier (asked on first go otherwise)")
     p_login.add_argument("--github", action="store_true",
                          help="recover your identity via GitHub (device flow)")
     p_login.set_defaults(func=cmd_login)
@@ -71,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     p_retry = sub.add_parser(
         "retry-upload",
         help="flush any trials that ran but failed to upload (also runs automatically before `go`)")
-    p_retry.set_defaults(func=cmd_retry_upload)
+    p_retry.set_defaults(func=cmd_retry_upload, lease_hint=True)
 
     for name, help_, is_resume in (
         ("go", "fetch an assignment and run it", False),
@@ -85,10 +84,24 @@ def main(argv: list[str] | None = None) -> int:
             help="run even if your deep-swe checkout differs from the server's pinned version",
         )
         p.add_argument("--dev-agent", help=argparse.SUPPRESS)  # oracle/nop for pipeline tests
-        p.set_defaults(func=cmd_go, resume=is_resume)
+        p.set_defaults(func=cmd_go, resume=is_resume, lease_hint=True)
 
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (KeyboardInterrupt, EOFError):
+        # single choke point for every command: Ctrl-C during a run (the
+        # batch banner promises it's safe) or EOF from piped/non-tty stdin
+        # hitting input() must not dump a raw traceback. 130 = SIGINT.
+        # The lease reassurance is only true of the lease-touching commands —
+        # cancelling `dradar login`'s device flow must not send a brand-new
+        # volunteer chasing `dradar resume` on an unconfigured machine.
+        if getattr(args, "lease_hint", False):
+            print("\ninterrupted — any held leases stay active; `dradar resume` "
+                  "continues where you left off (or the lease expires on its own)")
+        else:
+            print("\ninterrupted")
+        return 130
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """Volunteer identity: login/register/rename + GitHub device-flow binding.
 
 Split out of cli.py to separate "who am I on this server" concerns from the
-doctor (environment checks) and run-loop (bundle/menu execution) concerns
+doctor (environment checks) and run-loop (held-batch/menu execution) concerns
 that used to share one file.
 """
 
@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import pending
 from .api_client import ApiClient, ApiError
-from .local_config import HOME, TIERS, _load_config, _save_config
+from .local_config import HOME, _load_config, _save_config
 
 
 def _auto_register(cfg: dict) -> None:
@@ -47,7 +47,9 @@ def _client(cfg: dict, auto_register: bool = False) -> ApiClient:
 
 
 def cmd_login(args) -> int:
-    cfg = _load_config()
+    # login rewrites the config, so it tolerates a corrupt one — it's the
+    # recovery command the corrupt-config error tells the volunteer to run.
+    cfg = _load_config(fresh_on_corrupt=True)
     cfg["server"] = args.server or cfg.get("server")
     cfg["token"] = args.token or cfg.get("token")
     if not cfg.get("token") and getattr(args, "nickname", None):
@@ -62,8 +64,6 @@ def cmd_login(args) -> int:
         print(f"registered as {ack['nickname']}")
     if args.tasks_root:
         cfg["tasks_root"] = str(Path(args.tasks_root).expanduser().resolve())
-    if getattr(args, "tier", None):
-        cfg["tier"] = args.tier
     if not cfg.get("server"):
         sys.exit("need --server")
     if getattr(args, "github", False) and not cfg.get("token"):
@@ -199,5 +199,5 @@ def cmd_link_github(args) -> int:
     return 0
 
 
-__all__ = ["TIERS", "_auto_register", "_client", "cmd_login", "cmd_rename",
+__all__ = ["_auto_register", "_client", "cmd_login", "cmd_rename",
            "_github_device_token", "cmd_link_github", "cmd_status"]

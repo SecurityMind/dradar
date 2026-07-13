@@ -46,18 +46,23 @@ def test_load_tolerates_non_list_json(tmp_path: Path):
 
 def test_save_is_atomic_failed_commit_does_not_corrupt_existing_ledger(tmp_path: Path, monkeypatch):
     # This is a crash-safety net; a save that can itself leave a truncated
-    # file on disk would defeat the whole point. Simulate the failure mode
-    # that write_text() alone is vulnerable to (truncate-then-write, killed
-    # partway through) by making the atomic rename step fail after the temp
-    # file is written: the ORIGINAL ledger on disk must survive untouched.
+    # file on disk would defeat the whole point. Assert the INVARIANT rather
+    # than the mechanism (temp file + os.replace today): kill the save
+    # mid-write, leaving whatever partial content it got out on disk — the
+    # ledger a subsequent load() sees must be the complete ORIGINAL, never a
+    # truncated/corrupt version (which load() would drop wholesale).
     pending.record(tmp_path, {"assignment_id": "a1", "task_id": "t1"})
     before = pending.load(tmp_path)
 
-    def boom(*a, **kw):
-        raise OSError("simulated crash mid-commit")
-    monkeypatch.setattr(pending.os, "replace", boom)
+    real_write_text = Path.write_text
+
+    def partial_write(self, data, *a, **kw):
+        real_write_text(self, data[: len(data) // 2], *a, **kw)  # half lands on disk
+        raise OSError("simulated crash mid-write")
+    monkeypatch.setattr(Path, "write_text", partial_write)
     with pytest.raises(OSError):
         pending.record(tmp_path, {"assignment_id": "a2", "task_id": "t2"})
+    monkeypatch.undo()
 
     assert pending.load(tmp_path) == before  # untouched, not truncated/corrupted
 
@@ -81,14 +86,21 @@ def _make_trial_dir(tmp_path: Path, name: str = "t") -> Path:
     return trial_dir
 
 
+def _entry(trial_dir: Path, **overrides) -> dict:
+    """A pending-ledger entry dict — the shape _upload_trial takes."""
+    e = {"assignment_id": "a1", "nonce": "nonce1", "task_id": "t1",
+         "trial_dir": str(trial_dir), "meta": {}, "outcome": "completed",
+         "job_dir": None, "keep": True}
+    e.update(overrides)
+    return e
+
+
 def test_upload_success_clears_ledger(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     trial_dir = _make_trial_dir(tmp_path)
     pending.record(tmp_path, {"assignment_id": "a1", "task_id": "t1"})
     client = FakeClient(lambda aid: {"submission_id": "s1", "grade_status": "pending"})
-    outcome = runloop._upload_trial(
-        client, "a1", "nonce1", "t1", trial_dir / "artifacts" / "model.patch",
-        None, None, {"k": "v"}, "completed", None, keep=True)
+    outcome = runloop._upload_trial(client, _entry(trial_dir, meta={"k": "v"}))
     assert outcome == "submitted"
     assert pending.load(tmp_path) == []
 
@@ -100,15 +112,13 @@ def test_upload_failure_records_ledger_entry(tmp_path: Path, monkeypatch):
     def fail(aid):
         raise ApiError("server returned 500: internal error", status_code=500)
     client = FakeClient(fail)
-    outcome = runloop._upload_trial(
-        client, "a1", "nonce1", "t1", trial_dir / "artifacts" / "model.patch",
-        None, None, {"k": "v"}, "completed", None, keep=True)
+    attempted = _entry(trial_dir, meta={"k": "v"})
+    outcome = runloop._upload_trial(client, attempted)
     assert outcome == "upload-failed"
     entries = pending.load(tmp_path)
     assert len(entries) == 1
-    assert entries[0]["assignment_id"] == "a1"
+    assert entries[0] == attempted  # exactly what was attempted persists
     assert entries[0]["trial_dir"] == str(trial_dir)
-    assert entries[0]["meta"] == {"k": "v"}
 
 
 def test_upload_409_means_already_landed_clears_ledger(tmp_path: Path, monkeypatch):
@@ -119,9 +129,7 @@ def test_upload_409_means_already_landed_clears_ledger(tmp_path: Path, monkeypat
     def already(aid):
         raise ApiError("server returned 409: already submitted", status_code=409)
     client = FakeClient(already)
-    outcome = runloop._upload_trial(
-        client, "a1", "nonce1", "t1", trial_dir / "artifacts" / "model.patch",
-        None, None, {}, "completed", None, keep=True)
+    outcome = runloop._upload_trial(client, _entry(trial_dir))
     assert outcome == "submitted"
     assert pending.load(tmp_path) == []
 
@@ -134,9 +142,7 @@ def test_upload_410_means_expired_clears_ledger(tmp_path: Path, monkeypatch):
     def expired(aid):
         raise ApiError("server returned 410: lease expired", status_code=410)
     client = FakeClient(expired)
-    outcome = runloop._upload_trial(
-        client, "a1", "nonce1", "t1", trial_dir / "artifacts" / "model.patch",
-        None, None, {}, "completed", None, keep=True)
+    outcome = runloop._upload_trial(client, _entry(trial_dir))
     assert outcome == "expired"
     assert pending.load(tmp_path) == []
 
@@ -153,9 +159,7 @@ def test_transient_failure_with_409_in_message_is_not_misread_as_conflict(tmp_pa
     def fail(aid):
         raise ApiError("cannot reach https://dradar.example.com:8409: connection refused")
     client = FakeClient(fail)
-    outcome = runloop._upload_trial(
-        client, "a1", "nonce1", "t1", trial_dir / "artifacts" / "model.patch",
-        None, None, {}, "completed", None, keep=True)
+    outcome = runloop._upload_trial(client, _entry(trial_dir))
     assert outcome == "upload-failed"  # not "submitted"
     assert len(pending.load(tmp_path)) == 1  # entry survives for a real retry
 
@@ -168,12 +172,41 @@ def test_secret_patch_not_retryable_clears_any_ledger_entry(tmp_path: Path, monk
         "diff --git a b\n+ghp_ABCDEFghijkl0123456789ABCDEFghijkl0123\n")
     pending.record(tmp_path, {"assignment_id": "a1", "task_id": "t1"})
     client = FakeClient(lambda aid: {"submission_id": "s1"})
-    outcome = runloop._upload_trial(
-        client, "a1", "nonce1", "t1", trial_dir / "artifacts" / "model.patch",
-        None, None, {}, "completed", None, keep=True)
+    outcome = runloop._upload_trial(client, _entry(trial_dir))
     assert outcome == "not-uploaded"
     assert pending.load(tmp_path) == []  # not left to retry forever against the same secret
     assert not client.calls  # never even attempted the upload
+
+
+def test_crash_mid_submit_leaves_a_ledger_entry(tmp_path: Path, monkeypatch):
+    # The entry is recorded BEFORE the submit attempt: a process death
+    # mid-POST (Ctrl-C/kill/OOM while the multipart upload is in flight)
+    # must not orphan a completed, quota-burning trial. Simulate the death
+    # with an exception that is not an ApiError, so nothing catches it.
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+
+    def die(aid):
+        raise KeyboardInterrupt
+    client = FakeClient(die)
+    attempted = _entry(trial_dir)
+    with pytest.raises(KeyboardInterrupt):
+        runloop._upload_trial(client, attempted)
+    entries = pending.load(tmp_path)
+    assert len(entries) == 1
+    assert entries[0] == attempted  # survives for the next go/retry-upload
+
+
+def test_successful_submit_leaves_no_pre_recorded_entry_behind(tmp_path: Path, monkeypatch):
+    # Negative control for record-before-submit: on success the pre-recorded
+    # entry must be removed, not linger and get re-uploaded on the next go.
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    client = FakeClient(lambda aid: {"submission_id": "s1", "grade_status": "pending"})
+    outcome = runloop._upload_trial(client, _entry(trial_dir))
+    assert outcome == "submitted"
+    assert client.calls == ["a1"]  # the upload really happened
+    assert pending.load(tmp_path) == []
 
 
 # --- retry scan: reconstructs artifacts from a trial_dir alone -------------
@@ -283,3 +316,20 @@ def test_cmd_retry_upload_flushes_and_succeeds(tmp_path: Path, monkeypatch, caps
     assert rc == 0
     assert "all clear" in capsys.readouterr().out
     assert pending.load(tmp_path) == []
+
+
+def test_cmd_retry_upload_partial_failure_reports_rc_1_and_keeps_entry(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    t1 = _make_trial_dir(tmp_path, "t1")
+    pending.record(tmp_path, {"assignment_id": "a1", "nonce": "n1", "task_id": "task1",
+                              "trial_dir": str(t1), "meta": {}, "outcome": "completed"})
+
+    def fail(aid):
+        raise ApiError("server returned 500: internal error", status_code=500)
+    monkeypatch.setattr(runloop, "_load_config", lambda: {"server": "https://x", "token": "t"})
+    monkeypatch.setattr(runloop, "_client", lambda cfg: FakeClient(fail))
+    rc = runloop.cmd_retry_upload(None)
+    assert rc == 1
+    assert "still pending" in capsys.readouterr().out
+    entries = pending.load(tmp_path)
+    assert len(entries) == 1 and entries[0]["assignment_id"] == "a1"  # kept for the next retry
