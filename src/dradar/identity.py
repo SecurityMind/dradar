@@ -153,6 +153,8 @@ def cmd_status(args) -> int:
         note = ""
         if s["grade_status"] == "error":
             note = "  — infra hiccup, the cell reopens automatically for a fresh attempt"
+        elif s["grade_status"] == "invalid" and s.get("client_exception"):
+            note = f"  — {s['client_exception']}"
         print(f"  {s['task_id']:42s} {s['model']}@{s['effort']:7s} "
               f"{s['grade_status']:8s} {icon}  {_relative_time(s['submitted_at'])}{flags}{note}")
     if len(subs) > 20:

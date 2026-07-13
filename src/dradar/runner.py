@@ -109,6 +109,15 @@ def build_pier_command(
             "--ak", f"config_toml_file={allowlist}",
             "--ae", f"CODEX_AUTH_JSON_PATH={auth}",
         ]
+        # Server-pinned agent version. pier bakes `npm install -g
+        # @openai/codex@latest` into a Docker layer, so "latest" freezes at
+        # whenever THIS machine first built the image — stale images then
+        # fail hard on newer models (400 "requires a newer version of
+        # Codex"). Pinning changes the install command string, which busts
+        # that cached layer on every volunteer machine automatically, and
+        # puts the whole fleet on one known-good version chosen server-side.
+        if assignment.get("agent_version"):
+            cmd += ["--ak", f"version={assignment['agent_version']}"]
     elif agent == "claude-code":
         oauth_token = claude_oauth_token()
         if not oauth_token:
@@ -339,10 +348,65 @@ def summarize_result(result_path: Path | None) -> dict:
     except json.JSONDecodeError:
         return {}
     agent = data.get("agent_result") or {}
+    exc = data.get("exception_info") or {}
     return {
         "n_input_tokens": agent.get("n_input_tokens"),
         "n_cache_tokens": agent.get("n_cache_tokens"),
         "n_output_tokens": agent.get("n_output_tokens"),
         "n_agent_steps": agent.get("n_agent_steps"),
-        "exception_info": bool(data.get("exception_info")),
+        "exception_info": bool(exc),
+        # the WHY, not just the whether: rides client_meta to the server so
+        # `dradar status` / operators can tell rate-limit from stale-agent
+        # from auth failure without opening the uploaded result.json
+        "exception_type": exc.get("exception_type"),
     }
+
+
+def diagnose_exception(result_path: Path | None) -> dict:
+    """Classify a trial's recorded exception for honest console reporting:
+    {} when there is none, else {type, tail, kind} where kind is one of
+    stale-agent | rate-limit | auth | None (unrecognized). The message tail
+    matters most: pier's exception_message embeds the agent's actual output,
+    which for codex includes the API error JSON naming the real cause."""
+    if not result_path or not result_path.is_file():
+        return {}
+    try:
+        data = json.loads(result_path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    info = data.get("exception_info") or {}
+    if not info:
+        return {}
+    msg = info.get("exception_message") or ""
+    low = msg.lower()
+    kind = None
+    if "requires a newer version of codex" in low:
+        kind = "stale-agent"
+    elif any(s in low for s in ("rate limit", "rate_limit", "usage_limit",
+                                "too many requests", "429")):
+        kind = "rate-limit"
+    elif any(s in low for s in ("401", "unauthorized", "authentication failed",
+                                "invalid api key", "token expired")):
+        kind = "auth"
+    tail = [ln.strip() for ln in msg.splitlines() if ln.strip()][-6:]
+    return {"type": info.get("exception_type"), "kind": kind, "tail": tail}
+
+
+# Targeted advice per diagnose_exception kind. Only the rate-limit case may
+# mention quota — an unrecognized failure gets the artifact paths, not a
+# guess (a volunteer bug report proved "wait for your quota to reset" was
+# actively misleading for a version error).
+DIAG_ADVICE = {
+    "stale-agent": (
+        "the codex CLI baked into your pier container image is too old for "
+        "this model. Update dradar (add --refresh to your uvx command) and "
+        "re-run: the server now pins the agent version, which rebuilds the "
+        "image automatically. If this repeats on the latest dradar, tell the "
+        "radar operators — the server-side pin may need a bump."),
+    "rate-limit": (
+        "this looks like a genuine rate/usage limit — wait for your quota "
+        "window to reset, then claim again."),
+    "auth": (
+        "the agent could not authenticate inside the container — run "
+        "`codex login` again and re-check `dradar doctor`."),
+}

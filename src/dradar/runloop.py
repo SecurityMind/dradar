@@ -20,9 +20,9 @@ from .api_client import ApiClient, ApiError
 from .identity import _client
 from .local_config import HOME, _load_config
 from .runner import (
-    RunnerError, check_task_content_hash, ensure_pier, ensure_tasks_root,
-    local_deep_swe_commit, run_trial, summarize_result, sync_deep_swe_commit,
-    trial_artifact_paths,
+    DIAG_ADVICE, RunnerError, check_task_content_hash, diagnose_exception,
+    ensure_pier, ensure_tasks_root, local_deep_swe_commit, run_trial,
+    summarize_result, sync_deep_swe_commit, trial_artifact_paths,
 )
 from .scrub import scan_secrets, scrub_file
 
@@ -231,12 +231,23 @@ def _upload_trial(client: ApiClient, entry: dict) -> str:
 
     pending.remove(HOME, assignment_id)
     if ack.get("grade_status") == "invalid":
+        # Neutral by design: the cause (printed by _run_and_submit's
+        # diagnosis) may be anything from a stale agent image to a real rate
+        # limit — claiming "wait for your quota to reset" here misled a real
+        # volunteer whose quota was fine.
         print(f"recorded as interrupted (not graded): {ack['submission_id']} — "
-              "the cell stays open for a fresh run once your quota resets")
+              "no points lost, the cell reopens for a fresh attempt")
     else:
         print(f"submitted: {ack['submission_id']} (grading happens server-side)")
-    if job_dir and not entry.get("keep", False):
-        shutil.rmtree(job_dir, ignore_errors=True)
+    if job_dir:
+        if outcome == "interrupted":
+            # Always keep a failure's artifacts (result.json, agent logs):
+            # deleting them made the first volunteer bug report undiagnosable
+            # client-side. Completed runs stay tidy-by-default as before.
+            if Path(job_dir).is_dir():
+                print(f"  failure artifacts kept for diagnosis: {job_dir}")
+        elif not entry.get("keep", False):
+            shutil.rmtree(job_dir, ignore_errors=True)
     return "interrupted" if outcome == "interrupted" else "submitted"
 
 
@@ -262,6 +273,21 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     outcome = "interrupted" if interrupted else "completed"
     print(f"trial finished in {art.duration_sec/60:.1f} min (pier rc={art.returncode}, "
           f"outcome={outcome}); uploading...")
+    if interrupted:
+        # Say what ACTUALLY failed. pier's rc=0 covers only its own process;
+        # the recorded exception carries the in-container agent's real error
+        # (exit code, API rejection) — hiding it sent a volunteer chasing a
+        # quota problem that was a version problem.
+        diag = diagnose_exception(art.result)
+        if diag:
+            print(f"the agent failed inside the container: {diag.get('type') or 'unknown error'}")
+            for ln in diag.get("tail", []):
+                print(f"  | {ln[:300]}")
+            advice = DIAG_ADVICE.get(diag.get("kind"))
+            if advice:
+                print(f"  -> {advice}")
+        else:
+            print(f"no exception recorded; see the pier log: {art.log_path}")
 
     meta = {
         "dradar_version": __version__,
