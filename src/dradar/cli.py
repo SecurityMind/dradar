@@ -7,36 +7,22 @@ The actual command implementations live in sibling modules, split by concern:
   runloop.py   - the go/resume held-batch-and-menu execution loop
   local_config.py - the shared ~/.dradar/config.json + constants
 
-This file re-exports their public names (so `dradar.cli.whatever` keeps
-working for anything scripted against the old single-file layout) and owns
-only the argparse tree + `main()`, which is this package's console-script
-entry point (see pyproject.toml).
+This file owns only the argparse tree + `main()`, this package's
+console-script entry point (see pyproject.toml). Import everything else from
+the module that defines it — the single-file-era courtesy re-exports were
+dropped once a grep of every known consumer (this repo's tests and the ds0
+pipeline scripts) showed nothing reaching through `dradar.cli`.
 """
 
 import argparse
 import sys
 
 from . import __version__
-from .api_client import ApiClient, ApiError
-from .doctor import (
-    _CODEX_HINTS, _DOCKER_HINTS, _check, _probe, _platform, cmd_doctor,
-)
-from .identity import (
-    _auto_register, _client, _github_device_token, cmd_link_github,
-    cmd_login, cmd_rename, cmd_status,
-)
-from .local_config import CONFIG_PATH, HOME, _load_config, _save_config
-from .runloop import (
-    _check_version_pin, _choose_menu_entry, _claim_from_menu, _print_assignment,
-    _print_menu, _run_and_submit,
-    _go_menu, cmd_go, cmd_retry_upload,
-)
+from .doctor import cmd_doctor
+from .identity import cmd_link_github, cmd_login, cmd_rename, cmd_status
+from .runloop import cmd_go, cmd_retry_upload
 
-__all__ = [
-    "ApiClient", "ApiError", "HOME", "CONFIG_PATH",
-    "cmd_login", "cmd_rename", "cmd_link_github", "cmd_doctor", "cmd_go",
-    "cmd_retry_upload", "main",
-]
+__all__ = ["main"]
 
 
 def main(argv: list[str] | None = None) -> int:

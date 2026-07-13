@@ -333,3 +333,42 @@ def test_cmd_retry_upload_partial_failure_reports_rc_1_and_keeps_entry(tmp_path:
     assert "still pending" in capsys.readouterr().out
     entries = pending.load(tmp_path)
     assert len(entries) == 1 and entries[0]["assignment_id"] == "a1"  # kept for the next retry
+
+
+def _raise(status):
+    def behavior(_aid):
+        raise ApiError(f"server returned {status}: nope", status_code=status)
+    return behavior
+
+
+def test_definitively_rejected_upload_drops_ledger_entry(tmp_path: Path, monkeypatch, capsys):
+    """413/422/404 can never succeed with the same bytes — keeping the entry
+    would just re-fail identically on every future `dradar go`."""
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    outcome = runloop._upload_trial(FakeClient(_raise(413)), _entry(trial_dir))
+    assert outcome == "rejected"
+    assert pending.load(tmp_path) == []
+    out = capsys.readouterr().out
+    assert "retrying can't fix it" in out
+    assert str(trial_dir) in out  # the local files are named, not vaporized
+
+
+def test_transient_5xx_keeps_ledger_entry(tmp_path: Path, monkeypatch):
+    """Negative control: a 503 is retryable and must stay queued."""
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    outcome = runloop._upload_trial(FakeClient(_raise(503)), _entry(trial_dir))
+    assert outcome == "upload-failed"
+    assert [e["assignment_id"] for e in pending.load(tmp_path)] == ["a1"]
+
+
+def test_403_stays_retryable_by_policy(tmp_path: Path, monkeypatch):
+    """403 covers both a permanent nonce mismatch and a suspension that may
+    be lifted — dropping a suspended volunteer's completed trial would
+    destroy recoverable work, so it stays in the queue."""
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    outcome = runloop._upload_trial(FakeClient(_raise(403)), _entry(trial_dir))
+    assert outcome == "upload-failed"
+    assert [e["assignment_id"] for e in pending.load(tmp_path)] == ["a1"]

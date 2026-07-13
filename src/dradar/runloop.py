@@ -212,6 +212,19 @@ def _upload_trial(client: ApiClient, entry: dict) -> str:
                       "for someone else, dropping it")
                 pending.remove(HOME, assignment_id)
                 return "expired"
+            if exc.status_code in (404, 413, 422):
+                # Definitively rejected: the exact same bytes can never
+                # succeed (payload too large / unprocessable / assignment
+                # unknown), so an entry here would just fail identically on
+                # every future retry. 403 deliberately NOT in this list — it
+                # covers both a permanent nonce mismatch and a suspension
+                # that may be lifted, and dropping a suspended volunteer's
+                # completed trial would destroy recoverable work.
+                print(f"  {task_id}: the server rejected this upload for good ({exc}) — "
+                      f"retrying can't fix it, dropping it from the retry queue "
+                      f"(the local files stay in {patch.parent.parent})")
+                pending.remove(HOME, assignment_id)
+                return "rejected"
             print(f"  {task_id}: upload failed ({exc}) — kept for retry "
                   "(`dradar retry-upload`)")
             return "upload-failed"
