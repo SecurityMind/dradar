@@ -126,20 +126,30 @@ def _fake_pier(monkeypatch, work_dir, *, patch=True, trajectory=True,
         captured["job_name"] = job_name
         return ["pier", "run", job_name]
 
-    def fake_run(cmd, **kw):
-        trial = work_dir / "jobs" / captured["job_name"] / "task__t0"
-        (trial / "artifacts").mkdir(parents=True)
-        (trial / "agent").mkdir()
-        if patch:
-            (trial / "artifacts" / "model.patch").write_text("diff")
-        if trajectory:
-            (trial / "agent" / "trajectory.json").write_text("[]")
-        if result is not None:
-            (trial / "result.json").write_text(json.dumps(result))
-        return subprocess.CompletedProcess(cmd, rc)
+    class FakePopen:
+        # run_trial drives pier via Popen + a heartbeat wait loop; the fake
+        # lays the artifacts down at construction ("process started and
+        # finished") and reports done on the first wait().
+        def __init__(self, cmd, **kw):
+            trial = work_dir / "jobs" / captured["job_name"] / "task__t0"
+            (trial / "artifacts").mkdir(parents=True)
+            (trial / "agent").mkdir()
+            if patch:
+                (trial / "artifacts" / "model.patch").write_text("diff")
+            if trajectory:
+                (trial / "agent" / "trajectory.json").write_text("[]")
+            if result is not None:
+                (trial / "result.json").write_text(json.dumps(result))
+            self.returncode = rc
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            pass
 
     monkeypatch.setattr(runner_mod, "build_pier_command", fake_build)
-    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", FakePopen)
     return captured
 
 
@@ -158,13 +168,28 @@ def test_run_trial_on_started_exception_is_swallowed(tmp_path, monkeypatch):
 
 def test_run_trial_timeout_raises_naming_log(tmp_path, monkeypatch):
     monkeypatch.setattr(runner_mod, "build_pier_command", lambda *a, **k: ["pier"])
-    def fake_run(cmd, **kw):
-        # the wedged "pier" wrote its dying words to the log before hanging
-        kw["stdout"].write("docker: no space left on device\n")
-        raise subprocess.TimeoutExpired(cmd, kw["timeout"])
-    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
+    # deadline already passed -> the very first heartbeat check aborts
+    monkeypatch.setattr(runner_mod, "_trial_timeout_sec", lambda a: -1)
+    killed = []
+
+    class HungPopen:
+        def __init__(self, cmd, **kw):
+            # the wedged "pier" wrote its dying words to the log before hanging
+            kw["stdout"].write("docker: no space left on device\n")
+            kw["stdout"].flush()
+
+        def wait(self, timeout=None):
+            if killed:
+                return -9
+            raise subprocess.TimeoutExpired("pier", timeout)
+
+        def kill(self):
+            killed.append(True)
+
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", HungPopen)
     with pytest.raises(RunnerError) as exc:
         run_trial(_assignment("codex"), tmp_path, tmp_path)
+    assert killed  # the wedged process was reaped, not left running
     assert str(tmp_path / "aa1.log") in str(exc.value)
     # the actual cause is inlined, not just the file name
     assert "docker: no space left on device" in str(exc.value)
@@ -181,13 +206,21 @@ def test_run_trial_missing_patch_message_includes_log_tail(tmp_path, monkeypatch
     def fake_build(assignment, tasks_root, jobs_dir, job_name, home, dev_agent=None):
         captured["job_name"] = job_name
         return ["pier"]
-    def fake_run(cmd, **kw):
-        trial = tmp_path / "jobs" / captured["job_name"] / "task__t0"
-        (trial / "artifacts").mkdir(parents=True)   # no model.patch inside
-        kw["stdout"].write("agent auth rejected (401)\n")
-        return subprocess.CompletedProcess(cmd, 1)
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            trial = tmp_path / "jobs" / captured["job_name"] / "task__t0"
+            (trial / "artifacts").mkdir(parents=True)   # no model.patch inside
+            kw["stdout"].write("agent auth rejected (401)\n")
+            kw["stdout"].flush()
+            self.returncode = 1
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            pass
     monkeypatch.setattr(runner_mod, "build_pier_command", fake_build)
-    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", FakePopen)
     with pytest.raises(RunnerError) as exc:
         run_trial(_assignment("codex"), tmp_path, tmp_path)
     assert "model.patch missing" in str(exc.value)

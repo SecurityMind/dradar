@@ -441,7 +441,24 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
         else:
             print("no work available right now — thank you, check back later")
         return 0
-    return _run_batch(args, client, tasks_root, active)
+    rc = _run_batch(args, client, tasks_root, active)
+    # Free-pick: the batch was a snapshot taken at startup, but the classic
+    # first-session flow is "paste the command, then go claim more on the
+    # page while it runs" — those later claims used to be silently ignored
+    # until the next manual `dradar resume` (volunteer report, 2026-07-13).
+    # Re-fetch until nothing NEW appears; `seen` keeps a deliberately-skipped
+    # cell from being re-prompted in a loop (it stays held for a later
+    # resume). Menu-mode instances keep their one-cell-per-run contract.
+    seen = {a["assignment_id"] for a in active}
+    while rc == 0 and free_pick:
+        active, _ = _acquire_batch(client, args.yes)
+        fresh = [a for a in active if a["assignment_id"] not in seen]
+        if not fresh:
+            break
+        seen.update(a["assignment_id"] for a in fresh)
+        print(f"\n{len(fresh)} more cell(s) were claimed while that batch ran — continuing:")
+        rc = _run_batch(args, client, tasks_root, fresh)
+    return rc
 
 
 __all__ = ["cmd_go", "_go_menu",

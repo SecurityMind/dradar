@@ -98,6 +98,15 @@ def build_pier_command(
         "--disable-verification",
         "--yes",
     ]
+    # Task containers ship no git identity, so an agent's final `git commit`
+    # dies with "Author identity unknown" unless the model thinks to configure
+    # one (volunteer report, 2026-07-13). These ride pier's --ae into the
+    # agent's process env, which every git it spawns inherits. .invalid TLD:
+    # never routable, per RFC 2606.
+    for var in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
+        cmd += ["--ae", f"{var}=dradar-trial"]
+    for var in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        cmd += ["--ae", f"{var}=trial@dradar.invalid"]
     if agent == "codex":
         auth = codex_auth_path()
         if not auth.is_file():
@@ -265,6 +274,18 @@ def _tail(log_path: Path, n: int = 15) -> str:
     return "\n".join(lines[-n:])
 
 
+HEARTBEAT_SEC = 60
+
+
+def _last_activity(log_path: Path) -> str:
+    """The newest meaningful chunk of the pier log, for heartbeat lines.
+    pier redraws its progress bar with carriage returns inside one physical
+    line, so split on \\r as well and skip pure control/blank chunks."""
+    raw = _tail(log_path, 1)
+    chunks = [c.strip() for c in raw.replace("\r", "\n").splitlines() if c.strip()]
+    return (chunks[-1][:120] if chunks else "still running (no new log output)")
+
+
 def _trial_timeout_sec(assignment: dict) -> int:
     """Cap for one trial: a generous multiple of the server's estimate, with
     a floor for image pull/build."""
@@ -308,16 +329,38 @@ def run_trial(
     with log_path.open("w") as log:
         log.write("cmd=" + " ".join(cmd) + "\n")
         log.flush()
+        # Heartbeat loop instead of a blocking run: image build + a long
+        # agent turn can be silent for many minutes, and volunteers couldn't
+        # tell "working" from "wedged" without docker-exec'ing into the
+        # container (volunteer report, 2026-07-13). Once a minute, print
+        # elapsed time plus the newest pier log line.
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
+                                cwd=work_dir, env=env)
         try:
-            proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
-                                  cwd=work_dir, env=env, timeout=timeout_sec)
-        except subprocess.TimeoutExpired as exc:
-            log.flush()
-            raise RunnerError(
-                f"trial exceeded {timeout_sec // 60} min and was aborted "
-                f"(see {log_path}); docker/agent likely wedged\n"
-                f"last lines of the log:\n{_tail(log_path)}"
-            ) from exc
+            next_beat = started + HEARTBEAT_SEC
+            while True:
+                try:
+                    proc.wait(timeout=min(30, HEARTBEAT_SEC))
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                now = time.time()
+                if now - started > timeout_sec:
+                    log.flush()
+                    raise RunnerError(
+                        f"trial exceeded {timeout_sec // 60} min and was aborted "
+                        f"(see {log_path}); docker/agent likely wedged\n"
+                        f"last lines of the log:\n{_tail(log_path)}")
+                if now >= next_beat:
+                    next_beat = now + HEARTBEAT_SEC
+                    print(f"  … {int((now - started) / 60)} min elapsed — "
+                          f"{_last_activity(log_path)}")
+        except BaseException:
+            # Same contract subprocess.run had: no exception (timeout, Ctrl-C,
+            # anything) leaves a pier process running detached.
+            proc.kill()
+            proc.wait()
+            raise
     duration = time.time() - started
 
     job_dir, trial_dir = locate_artifacts(jobs_dir, job_name)
