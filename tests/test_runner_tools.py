@@ -183,6 +183,9 @@ def test_run_trial_timeout_raises_naming_log(tmp_path, monkeypatch):
                 return -9
             raise subprocess.TimeoutExpired("pier", timeout)
 
+        def terminate(self):
+            pass  # the hung pier ignores TERM; the grace window must escalate
+
         def kill(self):
             killed.append(True)
 

@@ -19,6 +19,7 @@ from . import __version__, pending
 from .api_client import ApiClient, ApiError
 from .identity import _client
 from .local_config import HOME, _load_config
+from .machine import acquire_run_lock, sweep_orphan_compose
 from .runner import (
     DIAG_ADVICE, BuildFlakeError, RunnerError, check_task_content_hash,
     diagnose_exception, ensure_pier, ensure_tasks_root, local_deep_swe_commit,
@@ -284,6 +285,13 @@ def _upload_trial(client: ApiClient, entry: dict) -> str:
     return "interrupted" if outcome == "interrupted" else "submitted"
 
 
+def _mark_stopped_quietly(client: ApiClient, assignment: dict) -> None:
+    try:
+        client.mark_stopped(assignment["assignment_id"])
+    except Exception:
+        pass
+
+
 def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     args, local_commit: str | None) -> str:
     """Run one assignment and upload the artifacts. Returns an outcome tag —
@@ -310,9 +318,14 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             print(f"trial failed: {exc}\n"
                   "the build failed twice — check your network/proxy and re-run "
                   "`dradar resume` (still free: the agent never started)")
+            _mark_stopped_quietly(client, assignment)
             return "failed"
         except RunnerError as exc:
             print(f"trial failed: {exc}")
+            # Nothing was uploaded, so tell the server to stop showing this
+            # cell as 解题中 (best-effort; the server also self-heals stale
+            # started marks after est x3 with no submission).
+            _mark_stopped_quietly(client, assignment)
             return "failed"
 
     stats = summarize_result(art.result)
@@ -398,6 +411,12 @@ def cmd_go(args) -> int:
     if not tasks_root:
         sys.exit("tasks_root not configured; run: dradar login --tasks-root <deep-swe/tasks>")
     tasks_root = Path(tasks_root).expanduser()
+
+    # One runner per machine, THEN sweep containers stranded by dead runs —
+    # the lock is what makes "a pier-shaped compose project exists right now"
+    # mean "nobody alive owns it" (see machine.py).
+    acquire_run_lock(HOME)
+    sweep_orphan_compose(args.yes)
 
     # Self-bootstrap the environment so a fresh machine needs far less manual
     # setup: clone the (public) task repo if it's missing, install pier if it's

@@ -131,6 +131,17 @@ class ApiClient:
             data={"assignment_id": assignment_id},
         )
 
+    def mark_stopped(self, assignment_id: str) -> dict[str, Any]:
+        """The counterpart of mark_started: this trial died client-side
+        (build flake, agent crash, abandonment) with nothing uploaded, so the
+        server should stop showing the cell as 解题中. Same best-effort
+        contract — callers swallow ApiError; a stale 'running' badge also
+        self-heals server-side after est x3 with no submission."""
+        return self._post(
+            "/api/v1/assignment/stopped",
+            data={"assignment_id": assignment_id},
+        )
+
     def submit(
         self,
         assignment_id: str,

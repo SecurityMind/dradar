@@ -380,9 +380,16 @@ def run_trial(
                           f"{_last_activity(log_path)}")
         except BaseException:
             # Same contract subprocess.run had: no exception (timeout, Ctrl-C,
-            # anything) leaves a pier process running detached.
-            proc.kill()
-            proc.wait()
+            # anything) leaves a pier process running detached. TERM first
+            # with a grace window: a SIGKILLed pier can never `docker compose
+            # down`, and its orphaned task container keeps the agent alive —
+            # burning quota with nobody left to harvest the result.
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
             raise
     duration = time.time() - started
 

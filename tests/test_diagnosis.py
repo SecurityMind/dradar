@@ -123,3 +123,19 @@ def test_completed_run_still_cleans_job_dir(monkeypatch, tmp_path: Path):
     tag = runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc123")
     assert tag == "submitted"
     assert not art.job_dir.exists()  # tidy-by-default unchanged for successes
+
+
+def test_failed_trial_reports_stopped_to_server(monkeypatch, tmp_path):
+    from dradar.runner import RunnerError
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+
+    def always_fails(*a, **kw):
+        raise RunnerError("model.patch missing")
+
+    monkeypatch.setattr(runloop, "run_trial", always_fails)
+    stopped = []
+    client = SubmitClient({})
+    client.mark_stopped = lambda aid: stopped.append(aid)
+    tag = runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc")
+    assert tag == "failed"
+    assert stopped == [ASSIGNMENT["assignment_id"]]
