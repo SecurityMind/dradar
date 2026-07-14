@@ -51,6 +51,29 @@ class RunnerError(RuntimeError):
     pass
 
 
+class BuildFlakeError(RunnerError):
+    """The trial died while BUILDING the task/proxy image — the agent never
+    started, so zero quota was consumed. Distinct from RunnerError because
+    the caller may retry it once for free; a Chinese-network ARM Mac hitting
+    ports.ubuntu.com is the canonical case (volunteer report, 2026-07-14:
+    this used to surface as 'model.patch missing (agent likely failed)',
+    blaming the agent for a mirror hiccup)."""
+
+
+# Signatures (in the pier log tail) of an image build / infra failure that
+# happened before any agent ran. Deliberately specific: a false positive here
+# would auto-retry a run that DID burn quota.
+_BUILD_FLAKE_MARKERS = (
+    "ports.ubuntu.com", "archive.ubuntu.com", "failed to solve",
+    "apt-get update", "Temporary failure resolving", "proxyconnect",
+    "TLS handshake timeout", "error getting credentials",
+)
+
+
+def _looks_like_build_flake(log_tail: str) -> bool:
+    return any(m in log_tail for m in _BUILD_FLAKE_MARKERS)
+
+
 def codex_auth_path() -> Path:
     """Where codex keeps its auth (CODEX_AUTH_JSON_PATH overrides the default).
     Shared with doctor so its "agent ready" verdict tests the exact condition
@@ -363,12 +386,29 @@ def run_trial(
             raise
     duration = time.time() - started
 
-    job_dir, trial_dir = locate_artifacts(jobs_dir, job_name)
+    tail = _tail(log_path)
+    try:
+        job_dir, trial_dir = locate_artifacts(jobs_dir, job_name)
+    except RunnerError:
+        if _looks_like_build_flake(tail):
+            raise BuildFlakeError(
+                f"the task environment failed to BUILD (mirror/network flake) — "
+                f"the agent never started and no quota was used.\n"
+                f"last lines of the log:\n{tail}")
+        raise
     patch, trajectory, result = trial_artifact_paths(trial_dir)
     if not patch.is_file():
+        # No patch at all means the agent never produced anything — usually
+        # the environment died under it. Say which, instead of blaming the
+        # agent for a mirror hiccup.
+        if _looks_like_build_flake(tail):
+            raise BuildFlakeError(
+                f"the task environment failed to BUILD (mirror/network flake) — "
+                f"the agent never started and no quota was used.\n"
+                f"last lines of the log:\n{tail}")
         raise RunnerError(
             f"model.patch missing (agent likely failed; see {log_path} and {trial_dir})\n"
-            f"last lines of the log:\n{_tail(log_path)}"
+            f"last lines of the log:\n{tail}"
         )
     return TrialArtifacts(
         job_dir=job_dir,

@@ -108,3 +108,95 @@ def test_quota_share_tiny_pct_never_shows_zero():
         {"est_quota_pct": 0.05, "tier_windows_usd": WINDOWS})
     assert "20x Pro ~<0.01%" in line
     assert "0.00%" not in line
+
+
+# --- build-flake classification + free auto-retry (volunteer report #3) ------
+
+import pytest
+
+from dradar.runner import BuildFlakeError, RunnerError, run_trial
+
+
+def _flaky_pier(monkeypatch, work_dir, fail_times, log_line, make_patch=True):
+    """Fake Popen that fails the build `fail_times` times (no trial dir, flake
+    marker in the log), then succeeds."""
+    captured = {"job_names": [], "calls": 0}
+
+    def fake_build(assignment, tasks_root, jobs_dir, job_name, home, dev_agent=None):
+        captured["job_names"].append(job_name)
+        return ["pier", "run", job_name]
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            captured["calls"] += 1
+            kw["stdout"].write(log_line + "\n")
+            kw["stdout"].flush()
+            if captured["calls"] > fail_times:
+                trial = work_dir / "jobs" / captured["job_names"][-1] / "task__t0"
+                (trial / "artifacts").mkdir(parents=True)
+                (trial / "agent").mkdir()
+                if make_patch:
+                    (trial / "artifacts" / "model.patch").write_text("diff")
+            self.returncode = 0 if captured["calls"] > fail_times else 1
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(runner_mod, "build_pier_command", fake_build)
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", FakePopen)
+    return captured
+
+
+def test_build_flake_raises_typed_error_naming_the_real_cause(tmp_path, monkeypatch):
+    _flaky_pier(monkeypatch, tmp_path, fail_times=99,
+                log_line="E: Failed to fetch http://ports.ubuntu.com/... 503")
+    with pytest.raises(BuildFlakeError) as exc:
+        run_trial({"assignment_id": "a1", "task_id": "t", "agent": "codex",
+                   "model": "m", "effort": "low", "est_minutes": 2}, tmp_path, tmp_path)
+    assert "no quota was used" in str(exc.value)
+    assert "ports.ubuntu.com" in str(exc.value)
+
+
+def test_non_flake_missing_patch_stays_plain_runner_error(tmp_path, monkeypatch):
+    _flaky_pier(monkeypatch, tmp_path, fail_times=0, make_patch=False,
+                log_line="agent crashed for mysterious reasons")
+    with pytest.raises(RunnerError) as exc:
+        run_trial({"assignment_id": "a1", "task_id": "t", "agent": "codex",
+                   "model": "m", "effort": "low", "est_minutes": 2}, tmp_path, tmp_path)
+    assert not isinstance(exc.value, BuildFlakeError)
+    assert "model.patch missing" in str(exc.value)
+
+
+def test_run_and_submit_retries_build_flake_once(monkeypatch, capsys, tmp_path):
+    from test_go_menu import ASSIGNMENT, SubmitClient, _fake_art
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    calls = {"n": 0}
+
+    def flaky_run(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise BuildFlakeError("mirror flake")
+        return _fake_art(tmp_path, rc=0)
+
+    monkeypatch.setattr(runloop, "run_trial", flaky_run)
+    client = SubmitClient({})
+    tag = runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc")
+    assert tag == "submitted" and calls["n"] == 2
+    assert "retrying once automatically" in capsys.readouterr().out
+
+
+def test_run_and_submit_gives_up_after_second_flake(monkeypatch, capsys, tmp_path):
+    from test_go_menu import ASSIGNMENT, SubmitClient
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+
+    def always_flaky(*a, **kw):
+        raise BuildFlakeError("mirror flake")
+
+    monkeypatch.setattr(runloop, "run_trial", always_flaky)
+    client = SubmitClient({})
+    tag = runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc")
+    assert tag == "failed"
+    assert "failed twice" in capsys.readouterr().out

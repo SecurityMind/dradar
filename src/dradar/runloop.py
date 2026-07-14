@@ -20,9 +20,9 @@ from .api_client import ApiClient, ApiError
 from .identity import _client
 from .local_config import HOME, _load_config
 from .runner import (
-    DIAG_ADVICE, RunnerError, check_task_content_hash, diagnose_exception,
-    ensure_pier, ensure_tasks_root, local_deep_swe_commit, run_trial,
-    summarize_result, sync_deep_swe_commit, trial_artifact_paths,
+    DIAG_ADVICE, BuildFlakeError, RunnerError, check_task_content_hash,
+    diagnose_exception, ensure_pier, ensure_tasks_root, local_deep_swe_commit,
+    run_trial, summarize_result, sync_deep_swe_commit, trial_artifact_paths,
 )
 from .scrub import scan_secrets, scrub_file
 
@@ -291,13 +291,29 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     hash_match = check_task_content_hash(assignment, tasks_root)
     work_dir = HOME / "work"
     print("running trial (this can take a while)...")
-    try:
-        art = run_trial(
-            assignment, tasks_root, work_dir, dev_agent=args.dev_agent,
-            on_started=lambda: client.mark_started(assignment["assignment_id"]))
-    except RunnerError as exc:
-        print(f"trial failed: {exc}")
-        return "failed"
+    for attempt in (1, 2):
+        try:
+            art = run_trial(
+                assignment, tasks_root, work_dir, dev_agent=args.dev_agent,
+                on_started=lambda: client.mark_started(assignment["assignment_id"]))
+            break
+        except BuildFlakeError as exc:
+            # The image build died before the agent ran — a free failure
+            # (zero quota), and mirror flakes usually pass on the second
+            # attempt, so retry once automatically instead of bouncing the
+            # volunteer. A second flake in a row is likely a real network
+            # problem worth a human look.
+            if attempt == 1:
+                print(f"environment build failed ({exc})\n"
+                      "no quota was consumed — retrying once automatically...")
+                continue
+            print(f"trial failed: {exc}\n"
+                  "the build failed twice — check your network/proxy and re-run "
+                  "`dradar resume` (still free: the agent never started)")
+            return "failed"
+        except RunnerError as exc:
+            print(f"trial failed: {exc}")
+            return "failed"
 
     stats = summarize_result(art.result)
     # An interrupted/failed run (nonzero pier rc or recorded exception) is not a
