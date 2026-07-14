@@ -412,11 +412,20 @@ def cmd_go(args) -> int:
         sys.exit("tasks_root not configured; run: dradar login --tasks-root <deep-swe/tasks>")
     tasks_root = Path(tasks_root).expanduser()
 
-    # One runner per machine, THEN sweep containers stranded by dead runs —
-    # the lock is what makes "a pier-shaped compose project exists right now"
-    # mean "nobody alive owns it" (see machine.py).
-    acquire_run_lock(HOME)
-    sweep_orphan_compose(args.yes)
+    # One runner per machine by default, THEN sweep containers stranded by
+    # dead runs — the lock is what makes "a pier-shaped compose project
+    # exists right now" mean "nobody alive owns it" (see machine.py).
+    # --parallel opts out: the server-side checkout dispenser keeps parallel
+    # sessions from racing over cells, so the lock's only remaining job is
+    # warning about same-machine resource contention.
+    if getattr(args, "parallel", False):
+        args.yes = True  # a dispenser that stamps at checkout can't prompt
+        print("--parallel: running alongside other dradar sessions on this "
+              "machine. Cells are split safely server-side, but the sessions "
+              "share this machine's CPU/RAM — expect slower individual runs.")
+    else:
+        acquire_run_lock(HOME)
+        sweep_orphan_compose(args.yes)
 
     # Self-bootstrap the environment so a fresh machine needs far less manual
     # setup: clone the (public) task repo if it's missing, install pier if it's
@@ -495,6 +504,56 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict]) ->
     return 0 if ok else 1
 
 
+def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
+                       active: list[dict]) -> int | None:
+    """The parallel-safe run loop: repeatedly ask the server to atomically
+    check out the next not-yet-started cell, run it, repeat until drained.
+    N sessions (or machines) doing this concurrently partition the held
+    batch instead of racing over a shared snapshot. Returns None when the
+    server predates the checkout endpoint — the caller falls back to the
+    legacy whole-batch flow."""
+    local_commit = _check_version_pin(active[0].get("deep_swe_commit"), tasks_root,
+                                      args.allow_task_drift)
+    results, failed_ids = [], set()
+    while True:
+        try:
+            data = client.checkout()
+        except ApiError as exc:
+            if exc.status_code == 404:
+                return None if not results else 0  # old server / endpoint gone
+            _exit_for(exc)
+        assignment = data.get("assignment")
+        if not assignment:
+            if not results:
+                print("nothing left to start — every held cell is already "
+                      "checked out (another session?) or submitted. "
+                      "`dradar status` shows where things stand.")
+            break
+        if assignment["assignment_id"] in failed_ids:
+            # Our own earlier failure re-entered the dispenser (the failure
+            # path reports 'stopped'). Leave it checked out and move on —
+            # retrying the same broken cell in a tight loop helps nobody;
+            # a later `dradar resume` (or another session) can pick it up.
+            print(f"skipping {assignment['task_id']} — it already failed in "
+                  "this session; it stays leased for a later retry")
+            continue
+        extra = data.get("unstarted")
+        print(f"\n=== checked out {assignment['task_id']} "
+              f"{assignment['model']}@{assignment['effort']}"
+              + (f" · {extra} more waiting" if extra else "") + " ===")
+        _print_assignment(assignment)
+        if not args.dev_agent and assignment.get("est_quota_pct"):
+            print("  it's your call whether you have room for this — dradar doesn't track "
+                  "your subscription usage. If you don't finish before the lease expires, "
+                  "the cell just reopens for someone else and nothing is counted.")
+        outcome = _run_and_submit(client, assignment, tasks_root, args, local_commit)
+        if outcome == "failed":
+            failed_ids.add(assignment["assignment_id"])
+        results.append(outcome)
+    ok = all(o in ("submitted", "interrupted") for o in results)
+    return 0 if ok else 1
+
+
 def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
     """Run the volunteer's held batch of cells serially: acquire the batch
     (web-claimed on free-pick instances, menu-claimed otherwise), explain an
@@ -509,6 +568,14 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
         else:
             print("no work available right now — thank you, check back later")
         return 0
+    # Non-interactive free-pick runs go through the parallel-safe checkout
+    # loop (the standard paste-command path). Interactive runs keep the
+    # legacy batch flow — its per-cell confirm/skip prompts don't translate
+    # to a dispenser that stamps cells at checkout time.
+    if free_pick and args.yes:
+        rc = _run_checkout_loop(args, client, tasks_root, active)
+        if rc is not None:
+            return rc
     rc = _run_batch(args, client, tasks_root, active)
     # Free-pick: the batch was a snapshot taken at startup, but the classic
     # first-session flow is "paste the command, then go claim more on the

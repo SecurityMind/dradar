@@ -131,6 +131,15 @@ class ApiClient:
             data={"assignment_id": assignment_id},
         )
 
+    def checkout(self) -> dict[str, Any]:
+        """Atomically check out this volunteer's next not-yet-started cell —
+        the primitive that makes parallel sessions safe: N concurrent callers
+        get N different cells. Returns {assignment: dict|None, held, unstarted};
+        assignment None means everything held is already checked out or done.
+        404 on servers that predate the endpoint (caller falls back to the
+        legacy whole-batch flow)."""
+        return self._post("/api/v1/assignment/checkout", data={})
+
     def mark_stopped(self, assignment_id: str) -> dict[str, Any]:
         """The counterpart of mark_started: this trial died client-side
         (build flake, agent crash, abandonment) with nothing uploaded, so the

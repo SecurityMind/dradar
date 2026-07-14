@@ -70,6 +70,12 @@ def main(argv: list[str] | None = None) -> int:
             help="run even if your deep-swe checkout differs from the server's pinned version",
         )
         p.add_argument("--dev-agent", help=argparse.SUPPRESS)  # oracle/nop for pipeline tests
+        p.add_argument(
+            "--parallel", action="store_true",
+            help="allow a second dradar on this machine (implies -y): sessions "
+                 "split the held cells via server-side checkout, but they still "
+                 "share this machine's CPU/RAM — expect slower individual runs",
+        )
         p.set_defaults(func=cmd_go, resume=is_resume, lease_hint=True)
 
     args = parser.parse_args(argv)

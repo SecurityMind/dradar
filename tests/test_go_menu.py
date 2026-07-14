@@ -45,6 +45,11 @@ class FakeClient:
             raise result
         return result
 
+    def checkout(self):
+        # The default fake predates the per-cell dispenser, so callers take
+        # the legacy whole-batch path these tests were written against.
+        raise ApiError("not found", status_code=404)
+
 
 def _args(yes=True, dev_agent=None):
     return argparse.Namespace(yes=yes, dev_agent=dev_agent, resume=False,
