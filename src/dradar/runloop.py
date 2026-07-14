@@ -27,14 +27,47 @@ from .runner import (
 from .scrub import scan_secrets, scrub_file
 
 
+def _fmt_pct(pct: float) -> str:
+    """Adaptive precision, mirroring the radar page's price tags exactly so
+    the CLI and the cell a volunteer just clicked always show the same
+    number."""
+    if pct >= 9.95:
+        return str(round(pct))
+    if pct >= 0.95:
+        return f"{pct:.1f}"
+    if pct >= 0.005:
+        return f"{pct:.2f}"
+    return "<0.01"
+
+
+def _quota_share_line(a: dict) -> str:
+    """The estimate's weekly-quota share, per subscription tier. The server's
+    est_quota_pct is Plus-denominated; printing it bare made a 20x Pro
+    volunteer read a 20x-overstated cost (their web tag said 0.01%, the CLI
+    said 0.3% — same dollars, different denominator). When the assignment
+    carries the tier windows, convert and show all three so everyone reads
+    their own column; otherwise label the denomination instead of implying
+    it's universal."""
+    pct = a.get("est_quota_pct")
+    if pct is None:
+        return "?"
+    windows = a.get("tier_windows_usd") or {}
+    plus = windows.get("plus")
+    if not plus:
+        return f"~{pct}% of a weekly (7d) Plus quota window (less on Pro tiers)"
+    parts = [f"{label} ~{_fmt_pct(pct * plus / windows[key])}%"
+             for key, label in (("plus", "Plus"), ("pro-5x", "5x Pro"),
+                                ("pro-20x", "20x Pro")) if windows.get(key)]
+    return "share of your weekly (7d) quota: " + " / ".join(parts)
+
+
 def _print_assignment(a: dict) -> None:
     print(f"assignment {a['assignment_id']}: {a['task_id']}")
     print(f"  model={a['model']} effort={a['effort']} agent={a['agent']}")
     if a.get("est_minutes"):
         # Denominated in the weekly window: Codex removed the 5h rolling
         # limit (2026-07), the 7d quota is the only constraint left.
-        print(f"  estimated: ~{a['est_minutes']} min, "
-              f"~{a.get('est_quota_pct', '?')}% of a weekly (7d) quota window")
+        print(f"  estimated: ~{a['est_minutes']} min, {_quota_share_line(a)}")
     print(f"  lease expires: {a['expires_at']}")
 
 

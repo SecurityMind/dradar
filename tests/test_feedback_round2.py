@@ -81,3 +81,30 @@ def test_menu_mode_keeps_single_run_contract(monkeypatch, tmp_path):
     rc = runloop._go_menu(_args(), {}, client, tmp_path)
     assert rc == 0
     assert ran == ["a1"]  # no auto-continuation on menu-mode instances
+
+
+# --- quota-share denomination (owner report 2026-07-14) ----------------------
+
+WINDOWS = {"plus": 91.37, "pro-5x": 456.86, "pro-20x": 1827.42}
+
+
+def test_quota_share_converts_per_tier():
+    line = runloop._quota_share_line(
+        {"est_quota_pct": 0.5, "tier_windows_usd": WINDOWS})
+    # 0.5% of Plus = 0.10% of 5x = 0.025% of 20x (adaptive precision, same
+    # as the radar page's tags; 0.025 renders 0.02 under binary float)
+    assert "Plus ~0.50%" in line
+    assert "5x Pro ~0.10%" in line
+    assert "20x Pro ~0.02%" in line
+
+
+def test_quota_share_without_windows_labels_denomination():
+    line = runloop._quota_share_line({"est_quota_pct": 0.5})
+    assert "Plus" in line and "0.5" in line  # old server: say what 0.5% means
+
+
+def test_quota_share_tiny_pct_never_shows_zero():
+    line = runloop._quota_share_line(
+        {"est_quota_pct": 0.05, "tier_windows_usd": WINDOWS})
+    assert "20x Pro ~<0.01%" in line
+    assert "0.00%" not in line
