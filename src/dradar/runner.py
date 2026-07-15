@@ -519,6 +519,15 @@ def diagnose_exception(result_path: Path | None) -> dict:
     elif any(s in low for s in ("401", "unauthorized", "authentication failed",
                                 "invalid api key", "token expired")):
         kind = "auth"
+    elif "at capacity" in low:
+        # codex treats a momentary "Selected model is at capacity" as a fatal
+        # turn.failed, which pier reports as a plain nonzero exit -- this is
+        # not a real failure of the agent's work (volunteer report #3,
+        # 2026-07-15: caught mid-run after 1,327 passing tests). A real fix
+        # (preserve the container, resume the root session) needs an
+        # upstream pier change; until that ships, classify it honestly
+        # instead of leaving it "unrecognized".
+        kind = "model-capacity"
     tail = [ln.strip() for ln in msg.splitlines() if ln.strip()][-6:]
     return {"type": info.get("exception_type"), "kind": kind, "tail": tail}
 
@@ -540,4 +549,10 @@ DIAG_ADVICE = {
     "auth": (
         "the agent could not authenticate inside the container — run "
         "`codex login` again and re-check `dradar doctor`."),
+    "model-capacity": (
+        "the model was momentarily at capacity and codex treated it as a "
+        "fatal error, even if your run was otherwise going fine — this is a "
+        "known upstream issue, not something wrong with your setup or your "
+        "work. A real fix (resuming instead of restarting) is in flight "
+        "upstream; for now just claim a fresh cell and re-run."),
 }

@@ -63,6 +63,12 @@ def test_diagnose_classifies_rate_limit(tmp_path):
     assert d["kind"] == "rate-limit"
 
 
+def test_diagnose_classifies_model_capacity(tmp_path):
+    d = diagnose_exception(_result(tmp_path,
+        "turn.failed: Selected model is at capacity. Please try a different model."))
+    assert d["kind"] == "model-capacity"
+
+
 def test_diagnose_unrecognized_has_no_kind(tmp_path):
     d = diagnose_exception(_result(tmp_path, "segfault in libfoo"))
     assert d["kind"] is None and d["tail"]
@@ -113,6 +119,22 @@ def test_interrupted_rate_limit_advice_mentions_quota(monkeypatch, capsys, tmp_p
     runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc123")
     out = capsys.readouterr().out
     assert "rate/usage limit" in out
+
+
+def test_interrupted_model_capacity_advice_is_not_a_quota_guess(
+        monkeypatch, capsys, tmp_path: Path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    art = _fake_art(tmp_path, rc=0, result_data={
+        "exception_info": {"exception_type": "NonZeroAgentExitCodeError",
+                           "exception_message":
+                               "Selected model is at capacity. Please try a different model."},
+        "agent_result": {}})
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: art)
+    client = InvalidAckClient({})
+    runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc123")
+    out = capsys.readouterr().out
+    assert "known upstream issue" in out
+    assert "wait for your quota" not in out.lower()   # not the rate-limit advice
 
 
 def test_completed_run_still_cleans_job_dir(monkeypatch, tmp_path: Path):
