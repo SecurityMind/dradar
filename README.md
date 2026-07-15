@@ -45,6 +45,23 @@ runner 已停止但状态仍卡住时才使用 `dradar release <assignment-id> -
 
 其他命令：`dradar status`（看自己的提交记录/积分/异常标记和占用摘要）、`dradar rename <新名字>`（改榜单显示名，积分不受影响）、`dradar link-github`（把账号和 GitHub 身份绑定，换机器能找回身份）、`dradar retry-upload`（补传因网络问题失败的提交）。
 
+## 租约心跳与隐私
+
+`dradar go` / `resume` 会为本次 CLI 进程建立一个轻量会话心跳：运行或上传时约
+60 秒一次，准备、排队或暂停时约 120 秒一次。它按“会话”上报，不按认领的格子
+数量上报；一次拿 10 个格子也仍然只有一条心跳。服务端还可以返回更慢的间隔，
+以便在高峰期主动降流量。
+
+心跳只包含 CLI 版本、粗粒度平台（macOS/Linux/WSL/Windows）、阶段、当前
+assignment id、递增序号和进度计数；不会包含任务内容、prompt、trajectory、patch、
+命令输出、主机名、用户名、硬件信息或订阅凭据。正常心跳只保留当前会话状态和
+5 分钟聚合桶，不逐条写审计日志。
+
+当前为影子观察阶段：服务端只记录“按候选规则本来会怀疑/释放”，**不会因为心跳
+中断自动释放任何格子**。断网也不会终止正在运行的 Pier。你始终可以用
+`dradar leases` 查看占用，用 `dradar release` / `release --all` 手动归还；运行中格子
+仍受默认保护，需明确 `--force` 才能释放。
+
 ## 环境要求
 
 - Docker（推荐 [OrbStack](https://orbstack.dev/)，macOS 上更轻量）

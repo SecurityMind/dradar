@@ -177,6 +177,19 @@ class ApiClient:
             },
         )
 
+    def runner_heartbeat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Best-effort lease-observation heartbeat (protocol v2).
+
+        It is deliberately JSON-only and bounded; the server stores current
+        state plus five-minute aggregates, never prompts, patches or command
+        output.  A short timeout keeps telemetry from holding up real work.
+        """
+        return self._post("/api/v1/runner/heartbeat", json=payload, timeout=3.0)
+
+    def runner_close(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Close a runner session without releasing any held lease."""
+        return self._post("/api/v1/runner/close", json=payload, timeout=3.0)
+
     def mark_stopped(self, assignment_id: str) -> dict[str, Any]:
         """The counterpart of mark_started: this trial died client-side
         (build flake, agent crash, abandonment) with nothing uploaded, so the

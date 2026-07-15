@@ -1,0 +1,174 @@
+"""Low-bandwidth runner heartbeat lifecycle.
+
+One session reports regardless of how many cells it holds.  Payloads contain
+only lifecycle metadata; never task text, prompts, trajectories, patches,
+commands, hostname, username, IP or hardware details.
+"""
+
+from __future__ import annotations
+
+import random
+import os
+import sys
+import threading
+import time
+import uuid
+
+from . import __version__
+from .api_client import ApiClient, ApiError
+
+
+def platform_family() -> str:
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform.startswith("linux"):
+        if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+            return "wsl"
+        return "linux"
+    return "other"
+
+
+class RunnerTelemetry:
+    """A daemon heartbeat with adaptive 60/120-second cadence.
+
+    Telemetry is best effort and can never abort a trial.  Three consecutive
+    failures produce one warning so a user knows the server can no longer see
+    their runner; recovery produces one matching notice.
+    """
+
+    def __init__(self, client: ApiClient, *, jitter: bool = True):
+        self.client = client
+        self.session_id = uuid.uuid4().hex
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._phase = "preparing"
+        self._active_assignment_id: str | None = None
+        self._batch_id: str | None = None
+        self._seq = 0
+        self._progress_counter = 0
+        self._interval = 120
+        self._failures = 0
+        self._warned = False
+        self._disabled = False
+        self._jitter = jitter
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="dradar-heartbeat", daemon=True)
+        self._thread.start()
+
+    def bind_batch(self, batch_id: str | None) -> None:
+        if not batch_id:
+            return
+        with self._lock:
+            changed = self._batch_id != batch_id
+            self._batch_id = batch_id
+            if changed:
+                self._progress_counter += 1
+        if changed:
+            self._wake.set()
+
+    def set_phase(self, phase: str, assignment_id: str | None = None) -> None:
+        if phase not in {"preparing", "queued", "running", "uploading", "paused"}:
+            raise ValueError(f"unknown runner phase {phase!r}")
+        with self._lock:
+            changed = (self._phase, self._active_assignment_id) != (phase, assignment_id)
+            self._phase = phase
+            self._active_assignment_id = assignment_id
+            if changed:
+                self._progress_counter += 1
+        if changed:
+            self._wake.set()
+
+    def _payload(self) -> dict:
+        with self._lock:
+            self._seq += 1
+            return {
+                "protocol_version": 2,
+                "client_version": __version__,
+                "session_id": self.session_id,
+                "batch_id": self._batch_id,
+                "seq": self._seq,
+                "phase": self._phase,
+                "active_assignment_id": self._active_assignment_id,
+                "client_monotonic_ms": int(time.monotonic() * 1000),
+                "progress_counter": self._progress_counter,
+                "platform": platform_family(),
+            }
+
+    def _send_once(self) -> int:
+        """Send once and return the server-selected next interval."""
+        if self._disabled:
+            return self._interval
+        try:
+            response = self.client.runner_heartbeat(self._payload())
+        except ApiError as exc:
+            # Older servers have no endpoint. Silence and disable rather than
+            # alarming users or producing a 404 every two minutes forever.
+            if exc.status_code == 404:
+                self._disabled = True
+                return self._interval
+            self._failures += 1
+            if self._failures >= 3 and not self._warned:
+                print("warning: the server cannot see this runner's heartbeat; "
+                      "work continues and your leases are not auto-released",
+                      file=sys.stderr)
+                self._warned = True
+            return self._interval
+        except Exception:
+            self._failures += 1
+            if self._failures >= 3 and not self._warned:
+                print("warning: runner heartbeat is unavailable; work continues and "
+                      "your leases are not auto-released", file=sys.stderr)
+                self._warned = True
+            return self._interval
+
+        if self._warned:
+            print("runner heartbeat recovered", file=sys.stderr)
+        self._failures = 0
+        self._warned = False
+        if response.get("batch_id"):
+            with self._lock:
+                self._batch_id = response["batch_id"]
+        requested = response.get("next_heartbeat_sec", self._interval)
+        try:
+            self._interval = min(600, max(30, int(requested)))
+        except (TypeError, ValueError):
+            pass
+        return self._interval
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            interval = self._send_once()
+            if self._jitter:
+                interval *= random.uniform(0.9, 1.1)
+            self._wake.wait(interval)
+            self._wake.clear()
+
+    def close(self, reason: str) -> None:
+        if reason not in {"completed", "paused", "interrupted", "error"}:
+            raise ValueError(f"unknown close reason {reason!r}")
+        self._stop.set()
+        self._wake.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._disabled:
+            return
+        with self._lock:
+            self._seq += 1
+            payload = {
+                "session_id": self.session_id,
+                "batch_id": self._batch_id,
+                "seq": self._seq,
+                "reason": reason,
+            }
+        try:
+            self.client.runner_close(payload)
+        except Exception:
+            pass

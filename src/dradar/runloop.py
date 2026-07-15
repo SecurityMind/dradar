@@ -26,6 +26,7 @@ from .runner import (
     run_trial, summarize_result, sync_deep_swe_commit, trial_artifact_paths,
 )
 from .scrub import scan_secrets, scrub_file
+from .telemetry import RunnerTelemetry
 
 
 def _fmt_pct(pct: float) -> str:
@@ -366,7 +367,8 @@ def _mark_stopped_quietly(client: ApiClient, assignment: dict) -> None:
 
 
 def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
-                    args, local_commit: str | None) -> str:
+                    args, local_commit: str | None,
+                    telemetry: RunnerTelemetry | None = None) -> str:
     """Run one assignment and upload the artifacts. Returns an outcome tag —
     never exits, so the held-batch loop can carry on with the next item."""
     hash_match = check_task_content_hash(assignment, tasks_root)
@@ -409,6 +411,8 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     # model failure: report it so the server marks it invalid, not graded 0.
     interrupted = art.returncode != 0 or stats.get("exception_info")
     outcome = "interrupted" if interrupted else "completed"
+    if telemetry:
+        telemetry.set_phase("uploading", assignment["assignment_id"])
     print(f"trial finished in {art.duration_sec/60:.1f} min (pier rc={art.returncode}, "
           f"outcome={outcome}); uploading...")
     if interrupted:
@@ -489,37 +493,45 @@ def cmd_go(args) -> int:
     if not tasks_root:
         sys.exit("tasks_root not configured; run: dradar login --tasks-root <deep-swe/tasks>")
     tasks_root = Path(tasks_root).expanduser()
+    telemetry = RunnerTelemetry(client)
+    telemetry.start()
+    close_reason = "error"
 
-    # One runner per machine by default, THEN sweep containers stranded by
-    # dead runs — the lock is what makes "a pier-shaped compose project
-    # exists right now" mean "nobody alive owns it" (see machine.py).
-    # --parallel opts out: the server-side checkout dispenser keeps parallel
-    # sessions from racing over cells, so the lock's only remaining job is
-    # warning about same-machine resource contention.
-    if getattr(args, "parallel", False):
-        args.yes = True  # a dispenser that stamps at checkout can't prompt
-        print("--parallel: running alongside other dradar sessions on this "
-              "machine. Cells are split safely server-side, but the sessions "
-              "share this machine's CPU/RAM — expect slower individual runs.")
-    else:
-        acquire_run_lock(HOME)
-        sweep_orphan_compose(args.yes)
-
-    # Self-bootstrap the environment so a fresh machine needs far less manual
-    # setup: clone the (public) task repo if it's missing, install pier if it's
-    # missing. Docker + codex login still can't be auto-installed (privileges /
-    # credentials) -- `dradar doctor` guides those.
     try:
-        ensure_tasks_root(tasks_root)
-        ensure_pier()
-    except RunnerError as exc:
-        sys.exit(str(exc))
+        # One runner per machine by default, THEN sweep containers stranded by
+        # dead runs — the lock is what makes "a pier-shaped compose project
+        # exists right now" mean "nobody alive owns it" (see machine.py).
+        if getattr(args, "parallel", False):
+            args.yes = True  # a dispenser that stamps at checkout can't prompt
+            print("--parallel: running alongside other dradar sessions on this "
+                  "machine. Cells are split safely server-side, but the sessions "
+                  "share this machine's CPU/RAM — expect slower individual runs.")
+        else:
+            acquire_run_lock(HOME)
+            sweep_orphan_compose(args.yes)
 
-    # Self-heal before anything else: a trial from a previous run that ran
-    # but failed to upload must not just sit on disk forever.
-    _retry_pending_uploads(client)
+        # Preparing is a real phase: cloning the task repo and installing pier
+        # can take minutes on a fresh machine. The heartbeat lets operators
+        # distinguish that from an abandoned claim without inspecting the host.
+        try:
+            ensure_tasks_root(tasks_root)
+            ensure_pier()
+        except RunnerError as exc:
+            sys.exit(str(exc))
 
-    return _go_menu(args, cfg, client, tasks_root)
+        telemetry.set_phase("queued")
+        # Self-heal before anything else: a trial from a previous run that ran
+        # but failed to upload must not just sit on disk forever.
+        _retry_pending_uploads(client)
+
+        rc = _go_menu(args, cfg, client, tasks_root, telemetry=telemetry)
+        close_reason = "completed" if rc == 0 else "paused"
+        return rc
+    except (KeyboardInterrupt, EOFError):
+        close_reason = "interrupted"
+        raise
+    finally:
+        telemetry.close(close_reason)
 
 
 def _acquire_batch(client: ApiClient, yes: bool) -> tuple[list[dict], bool]:
@@ -548,7 +560,8 @@ def _acquire_batch(client: ApiClient, yes: bool) -> tuple[list[dict], bool]:
     return active, free_pick
 
 
-def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict]) -> int:
+def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
+               telemetry: RunnerTelemetry | None = None) -> int:
     """Run a non-empty held batch serially: one version-pin check covers the
     whole batch (a single local checkout serves every cell; it sys.exit's on
     a mismatch unless --allow-task-drift), then per-cell confirm/skip/run."""
@@ -561,6 +574,8 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict]) ->
               "(Ctrl-C anytime; unrun cells auto-release):")
     results = []
     for i, assignment in enumerate(active, 1):
+        if telemetry:
+            telemetry.bind_batch(assignment.get("batch_id"))
         if n > 1:
             print(f"\n=== cell {i}/{n} ===")
         _print_assignment(assignment)
@@ -579,13 +594,19 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict]) ->
                 print("aborted (remaining leases stay active; use `dradar resume` "
                       "to continue or `dradar release` to give them back)")
                 return 1
-        results.append(_run_and_submit(client, assignment, tasks_root, args, local_commit))
+        if telemetry:
+            telemetry.set_phase("running", assignment["assignment_id"])
+        results.append(_run_and_submit(
+            client, assignment, tasks_root, args, local_commit, telemetry=telemetry))
+        if telemetry:
+            telemetry.set_phase("queued")
     ok = all(o in ("submitted", "interrupted") for o in results)
     return 0 if ok else 1
 
 
 def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
-                       active: list[dict]) -> int | None:
+                       active: list[dict],
+                       telemetry: RunnerTelemetry | None = None) -> int | None:
     """The parallel-safe run loop: repeatedly ask the server to atomically
     check out the next not-yet-started cell, run it, repeat until drained.
     N sessions (or machines) doing this concurrently partition the held
@@ -625,6 +646,9 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                   "later; `dradar release` gives it back.")
             break
         extra = data.get("unstarted")
+        if telemetry:
+            telemetry.bind_batch(assignment.get("batch_id"))
+            telemetry.set_phase("running", assignment["assignment_id"])
         print(f"\n=== checked out {assignment['task_id']} "
               f"{assignment['model']}@{assignment['effort']}"
               + (f" · {extra} more waiting" if extra else "") + " ===")
@@ -633,7 +657,10 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             print("  it's your call whether you have room for this — dradar doesn't track "
                   "your subscription usage. If you don't finish before the lease expires, "
                   "the cell just reopens for someone else and nothing is counted.")
-        outcome = _run_and_submit(client, assignment, tasks_root, args, local_commit)
+        outcome = _run_and_submit(
+            client, assignment, tasks_root, args, local_commit, telemetry=telemetry)
+        if telemetry:
+            telemetry.set_phase("queued")
         if outcome == "failed":
             failed_ids.add(assignment["assignment_id"])
         results.append(outcome)
@@ -641,7 +668,8 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
     return 0 if ok else 1
 
 
-def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
+def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
+             telemetry: RunnerTelemetry | None = None) -> int:
     """Run the volunteer's held batch of cells serially: acquire the batch
     (web-claimed on free-pick instances, menu-claimed otherwise), explain an
     empty one, hand a non-empty one to _run_batch."""
@@ -671,15 +699,17 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
         else:
             print("no work available right now — thank you, check back later")
         return 0
+    if telemetry:
+        telemetry.bind_batch(active[0].get("batch_id"))
     # Non-interactive free-pick runs go through the parallel-safe checkout
     # loop (the standard paste-command path). Interactive runs keep the
     # legacy batch flow — its per-cell confirm/skip prompts don't translate
     # to a dispenser that stamps cells at checkout time.
     if free_pick and args.yes:
-        rc = _run_checkout_loop(args, client, tasks_root, active)
+        rc = _run_checkout_loop(args, client, tasks_root, active, telemetry=telemetry)
         if rc is not None:
             return rc
-    rc = _run_batch(args, client, tasks_root, active)
+    rc = _run_batch(args, client, tasks_root, active, telemetry=telemetry)
     # Free-pick: the batch was a snapshot taken at startup, but the classic
     # first-session flow is "paste the command, then go claim more on the
     # page while it runs" — those later claims used to be silently ignored
@@ -695,7 +725,7 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
             break
         seen.update(a["assignment_id"] for a in fresh)
         print(f"\n{len(fresh)} more cell(s) were claimed while that batch ran — continuing:")
-        rc = _run_batch(args, client, tasks_root, fresh)
+        rc = _run_batch(args, client, tasks_root, fresh, telemetry=telemetry)
     return rc
 
 
