@@ -164,6 +164,25 @@ def cmd_status(args) -> int:
     if local_pending:
         print(f"\n{len(local_pending)} trial(s) ran but haven't uploaded yet "
               "— run `dradar retry-upload` to flush them")
+
+    # Lease visibility belongs in status as a short summary even though
+    # `dradar leases` owns the detailed view. This makes the recovery command
+    # discoverable precisely when a volunteer is wondering why work appears
+    # stuck. Keep it best-effort for compatibility with older servers.
+    try:
+        get_assignment = getattr(client, "get_assignment", None)
+        lease_data = get_assignment() if get_assignment else {}
+        active = lease_data.get("active")
+        if active is None:
+            one = lease_data.get("assignment")
+            active = [one] if one else []
+        if active:
+            running = sum(bool(item.get("started_at")) for item in active)
+            print(f"\n{len(active)} active lease(s): {running} running, "
+                  f"{len(active) - running} waiting — inspect with `dradar leases`; "
+                  "give back with `dradar release`")
+    except ApiError:
+        pass
     return 0
 
 

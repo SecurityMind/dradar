@@ -7,10 +7,13 @@ from dradar import identity
 
 
 class FakeStatusClient:
-    def __init__(self, payload):
+    def __init__(self, payload, active=None):
         self.payload = payload
+        self.active = active or []
     def my_submissions(self):
         return self.payload
+    def get_assignment(self):
+        return {"active": self.active}
 
 
 def test_cmd_status_prints_summary(monkeypatch, capsys, tmp_path):
@@ -49,3 +52,21 @@ def test_cmd_status_notes_local_pending(monkeypatch, capsys):
     from types import SimpleNamespace
     identity.cmd_status(SimpleNamespace())
     assert "retry-upload" in capsys.readouterr().out
+
+
+def test_cmd_status_makes_lease_recovery_commands_discoverable(monkeypatch, capsys):
+    payload = {"nickname": "v", "points": 0, "submissions": []}
+    active = [
+        {"assignment_id": "a1", "started_at": None},
+        {"assignment_id": "a2", "started_at": "2026-07-15T00:00:00+00:00"},
+    ]
+    monkeypatch.setattr(identity, "_load_config", lambda: {"server": "https://x", "token": "t"})
+    monkeypatch.setattr(identity, "_client", lambda cfg: FakeStatusClient(payload, active))
+    monkeypatch.setattr(identity.pending, "load", lambda home: [])
+    from types import SimpleNamespace
+
+    identity.cmd_status(SimpleNamespace())
+
+    out = capsys.readouterr().out
+    assert "1 running, 1 waiting" in out
+    assert "dradar leases" in out and "dradar release" in out

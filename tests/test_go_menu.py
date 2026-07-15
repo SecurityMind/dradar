@@ -52,7 +52,7 @@ class FakeClient:
         self.suggest_calls.append(n)
         return {"cells": self._suggested}
 
-    def checkout(self):
+    def checkout(self, exclude_assignment_ids=None):
         # The default fake predates the per-cell dispenser, so callers take
         # the legacy whole-batch path these tests were written against.
         raise ApiError("not found", status_code=404)

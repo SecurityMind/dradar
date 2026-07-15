@@ -76,6 +76,30 @@ def _looks_like_build_flake(log_tail: str) -> bool:
     return any(m in log_tail for m in _BUILD_FLAKE_MARKERS)
 
 
+def _result_exception_text(result_path: Path | None) -> str:
+    """The Pier console tail can end before Docker's actual build error.
+
+    Pier preserves the full setup exception in result.json, so inspect that
+    structured source as well. This is diagnostic-only: classification still
+    requires one of the deliberately narrow build markers above.
+    """
+    if not result_path or not result_path.is_file():
+        return ""
+    try:
+        data = json.loads(result_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return ""
+    info = data.get("exception_info") or {}
+    if not isinstance(info, dict):
+        return ""
+    return "\n".join(str(info.get(key) or "") for key in (
+        "exception_type", "exception_message", "exception_traceback"))
+
+
+def _diagnostic_tail(text: str, max_chars: int = 4000) -> str:
+    return text[-max_chars:]
+
+
 def codex_auth_path() -> Path:
     """Where codex keeps its auth (CODEX_AUTH_JSON_PATH overrides the default).
     Shared with doctor so its "agent ready" verdict tests the exact condition
@@ -449,11 +473,13 @@ def run_trial(
         # No patch at all means the agent never produced anything — usually
         # the environment died under it. Say which, instead of blaming the
         # agent for a mirror hiccup.
-        if _looks_like_build_flake(tail):
+        result_exception = _result_exception_text(result)
+        diagnostic = "\n".join(x for x in (tail, result_exception) if x)
+        if _looks_like_build_flake(diagnostic):
             raise BuildFlakeError(
                 f"the task environment failed to BUILD (mirror/network flake) — "
                 f"the agent never started and no quota was used.\n"
-                f"last lines of the log:\n{tail}")
+                f"build diagnostic:\n{_diagnostic_tail(diagnostic)}")
         raise RunnerError(
             f"model.patch missing (agent likely failed; see {log_path} and {trial_dir})\n"
             f"last lines of the log:\n{tail}"

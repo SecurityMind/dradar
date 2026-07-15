@@ -18,13 +18,20 @@ class CheckoutClient(FakeClient):
     def __init__(self, assignment_data, checkouts):
         super().__init__(assignment_data)
         self._checkouts = list(checkouts)   # dicts returned in order, or exceptions
+        self.checkout_exclusions = []
+        self.stopped = []
 
-    def checkout(self):
+    def checkout(self, exclude_assignment_ids=None):
+        self.checkout_exclusions.append(set(exclude_assignment_ids or ()))
         result = self._checkouts.pop(0) if self._checkouts else {"assignment": None,
                                                                  "held": 0, "unstarted": 0}
         if isinstance(result, Exception):
             raise result
         return result
+
+    def mark_stopped(self, assignment_id):
+        self.stopped.append(assignment_id)
+        return {"ok": True}
 
 
 def test_checkout_loop_runs_dispensed_cells_until_drained(monkeypatch, capsys, tmp_path):
@@ -55,8 +62,9 @@ def test_checkout_404_falls_back_to_legacy_batch(monkeypatch, tmp_path):
 
 def test_checkout_loop_never_retries_a_cell_that_failed_this_session(
         monkeypatch, capsys, tmp_path):
-    # the failure path reports 'stopped', which puts the cell back in the
-    # dispenser — the loop must not chew on it forever
+    # The failure path reports 'stopped', which puts the cell back in the
+    # dispenser. A current server honors the exclusion and hands out the next
+    # waiting cell instead of chewing on the failed one forever.
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
     attempts = []
 
@@ -68,13 +76,33 @@ def test_checkout_loop_never_retries_a_cell_that_failed_this_session(
     client = CheckoutClient(
         {"active": [_cell("bad")], "free_pick": True},
         [{"assignment": _cell("bad"), "held": 2, "unstarted": 1},
-         {"assignment": _cell("bad"), "held": 2, "unstarted": 1},   # re-dispensed
          {"assignment": _cell("ok"), "held": 2, "unstarted": 0},
          {"assignment": None, "held": 2, "unstarted": 0}])
     rc = runloop._go_menu(_args(), {}, client, tmp_path)
-    assert attempts == ["bad", "ok"]          # bad ran once, then skipped
+    assert attempts == ["bad", "ok"]
+    assert client.checkout_exclusions == [set(), {"bad"}, {"bad"}]
     assert rc == 1                            # the failure still fails the run
-    assert "already failed in" in capsys.readouterr().out.replace("\n", " ")
+
+
+def test_old_server_redispatching_failed_cell_is_unstamped_before_exit(
+        monkeypatch, capsys, tmp_path):
+    # Regression for case 019f656c-cf16-70e2-ae4c-d1d51146acb2: an old
+    # server ignores the exclusion and checks the failed cell out again. The
+    # CLI must call stopped once more before exiting, otherwise that second
+    # checkout leaves started_at set forever and future resume sees nothing.
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    monkeypatch.setattr(runloop, "_run_and_submit", lambda *a, **kw: "failed")
+    client = CheckoutClient(
+        {"active": [_cell("bad")], "free_pick": True},
+        [{"assignment": _cell("bad"), "held": 1, "unstarted": 0},
+         {"assignment": _cell("bad"), "held": 1, "unstarted": 0}])
+
+    rc = runloop._go_menu(_args(), {}, client, tmp_path)
+
+    assert rc == 1
+    assert client.checkout_exclusions == [set(), {"bad"}]
+    assert client.stopped == ["bad"]
+    assert "already failed in this session" in capsys.readouterr().out.replace("\n", " ")
 
 
 def test_interactive_run_keeps_legacy_batch_flow(monkeypatch, tmp_path):

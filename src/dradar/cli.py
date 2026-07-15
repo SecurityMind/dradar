@@ -5,6 +5,7 @@ The actual command implementations live in sibling modules, split by concern:
   identity.py  - login/register/rename/GitHub device-flow binding
   doctor.py    - environment preflight checks
   runloop.py   - the go/resume held-batch-and-menu execution loop
+  leases.py    - inspect/release held cells, including stuck-run recovery
   local_config.py - the shared ~/.dradar/config.json + constants
 
 This file owns only the argparse tree + `main()`, this package's
@@ -20,6 +21,7 @@ import sys
 from . import __version__
 from .doctor import cmd_doctor
 from .identity import cmd_link_github, cmd_login, cmd_rename, cmd_status
+from .leases import cmd_leases, cmd_release
 from .runloop import cmd_go, cmd_retry_upload
 
 __all__ = ["main"]
@@ -48,6 +50,21 @@ def main(argv: list[str] | None = None) -> int:
 
     p_st = sub.add_parser("status", help="see your own recent submissions, points, and flags")
     p_st.set_defaults(func=cmd_status)
+
+    p_ls = sub.add_parser(
+        "leases", help="list cells you currently hold and whether each is running or waiting")
+    p_ls.set_defaults(func=cmd_leases)
+
+    p_rel = sub.add_parser(
+        "release", help="give held cells back immediately (running work is protected by default)")
+    p_rel.add_argument("assignment_ids", nargs="*", metavar="ASSIGNMENT_ID")
+    p_rel.add_argument("--all", action="store_true", help="release all waiting cells")
+    p_rel.add_argument(
+        "--force", action="store_true",
+        help="also release running cells; stop the local runner first",
+    )
+    p_rel.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
+    p_rel.set_defaults(func=cmd_release, lease_hint=True)
 
     p_gh = sub.add_parser("link-github",
                           help="bind your GitHub account (name + avatar on the board, cross-machine recovery)")
@@ -105,8 +122,9 @@ def main(argv: list[str] | None = None) -> int:
         # cancelling `dradar login`'s device flow must not send a brand-new
         # volunteer chasing `dradar resume` on an unconfigured machine.
         if getattr(args, "lease_hint", False):
-            print("\ninterrupted — any held leases stay active; `dradar resume` "
-                  "continues where you left off (or the lease expires on its own)")
+            print("\ninterrupted — any held leases stay active; use `dradar leases` "
+                  "to inspect them, `dradar resume` to continue, or `dradar release` "
+                  "to give them back")
         else:
             print("\ninterrupted")
         return 130

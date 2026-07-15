@@ -139,14 +139,43 @@ class ApiClient:
             data={"assignment_id": assignment_id},
         )
 
-    def checkout(self) -> dict[str, Any]:
+    def checkout(self, exclude_assignment_ids: set[str] | list[str] | None = None) -> dict[str, Any]:
         """Atomically check out this volunteer's next not-yet-started cell —
         the primitive that makes parallel sessions safe: N concurrent callers
         get N different cells. Returns {assignment: dict|None, held, unstarted};
         assignment None means everything held is already checked out or done.
+        exclude_assignment_ids lets one CLI session avoid immediately
+        re-checking-out a cell that already failed locally in that session.
         404 on servers that predate the endpoint (caller falls back to the
         legacy whole-batch flow)."""
-        return self._post("/api/v1/assignment/checkout", data={})
+        excluded = sorted(set(exclude_assignment_ids or ()))
+        return self._post(
+            "/api/v1/assignment/checkout",
+            data={"exclude_assignment_ids": ",".join(excluded)},
+        )
+
+    def release_assignments(
+        self,
+        assignment_ids: list[str] | None = None,
+        *,
+        release_all: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Immediately release held cells owned by this volunteer.
+
+        The server requires exactly one target mode: explicit IDs or
+        release_all. Running cells are protected unless force=True. The
+        operation is idempotent so a lost response can be retried safely.
+        """
+        ids = list(dict.fromkeys(assignment_ids or ()))
+        return self._post(
+            "/api/v1/assignments/release",
+            data={
+                "assignment_ids": ",".join(ids),
+                "release_all": str(release_all).lower(),
+                "force": str(force).lower(),
+            },
+        )
 
     def mark_stopped(self, assignment_id: str) -> dict[str, Any]:
         """The counterpart of mark_started: this trial died client-side
@@ -156,7 +185,10 @@ class ApiClient:
         self-heals server-side after est x3 with no submission."""
         return self._post(
             "/api/v1/assignment/stopped",
-            data={"assignment_id": assignment_id},
+            # A cross-session cooldown keeps a second `--parallel` process
+            # from immediately taking the same cell that just failed here.
+            # Older servers ignore the extra form field harmlessly.
+            data={"assignment_id": assignment_id, "defer_seconds": "300"},
         )
 
     def submit(

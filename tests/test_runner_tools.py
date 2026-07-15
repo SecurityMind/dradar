@@ -282,6 +282,22 @@ def test_run_trial_missing_patch_raises(tmp_path, monkeypatch):
         run_trial(_assignment("codex"), tmp_path, tmp_path)
 
 
+def test_run_trial_classifies_build_failure_from_nested_result(tmp_path, monkeypatch):
+    # Pier's console tail can contain only a generic teardown; the actual
+    # Docker failure from the production case is preserved in result.json.
+    _fake_pier(
+        monkeypatch, tmp_path, patch=False,
+        result={"exception_info": {
+            "exception_type": "RuntimeError",
+            "exception_message": "RUN apt-get update: failed to solve: exit code 100",
+        }},
+    )
+    with pytest.raises(runner_mod.BuildFlakeError) as exc:
+        run_trial(_assignment("codex"), tmp_path, tmp_path)
+    assert "agent never started" in str(exc.value)
+    assert "failed to solve" in str(exc.value)
+
+
 def test_run_trial_missing_patch_message_includes_log_tail(tmp_path, monkeypatch):
     captured = {}
     def fake_build(assignment, tasks_root, jobs_dir, job_name, home, dev_agent=None):

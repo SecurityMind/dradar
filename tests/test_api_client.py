@@ -47,6 +47,45 @@ def test_suggest_passes_n_and_returns_cells():
     assert got == {"cells": [{"task_id": "t1"}]}
 
 
+def test_checkout_sends_failed_cell_exclusions():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = request.read()
+        return httpx.Response(200, json={"assignment": None, "held": 1, "unstarted": 0})
+
+    _client(handler).checkout(exclude_assignment_ids={"a2", "a1"})
+    assert b"exclude_assignment_ids=a1%2Ca2" in seen["body"]
+
+
+def test_release_sends_bulk_target_and_force_flags():
+    seen = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        seen["body"] = request.read()
+        return httpx.Response(200, json={
+            "released": [], "skipped": [], "already_released": [], "held": 0})
+
+    _client(handler).release_assignments(["a1", "a2"], force=True)
+    assert seen["path"] == "/api/v1/assignments/release"
+    assert b"assignment_ids=a1%2Ca2" in seen["body"]
+    assert b"release_all=false" in seen["body"]
+    assert b"force=true" in seen["body"]
+
+
+def test_mark_stopped_requests_cross_session_cooldown():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = request.read()
+        return httpx.Response(200, json={"ok": True, "retry_after": "later"})
+
+    _client(handler).mark_stopped("a1")
+    assert b"assignment_id=a1" in seen["body"]
+    assert b"defer_seconds=300" in seen["body"]
+
+
 def _do_submit(handler, tmp_path, with_optional):
     patch = tmp_path / "model.patch"
     patch.write_bytes(b"diff --git a/f b/f\n")

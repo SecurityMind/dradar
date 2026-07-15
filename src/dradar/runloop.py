@@ -390,11 +390,14 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 continue
             print(f"trial failed: {exc}\n"
                   "the build failed twice — check your network/proxy and re-run "
-                  "`dradar resume` (still free: the agent never started)")
+                  "`dradar resume` (still free: the agent never started), or "
+                  "use `dradar release` if you do not want to keep the cell")
             _mark_stopped_quietly(client, assignment)
             return "failed"
         except RunnerError as exc:
-            print(f"trial failed: {exc}")
+            print(f"trial failed: {exc}\n"
+                  "use `dradar resume` to retry later, or `dradar release` to "
+                  "give the cell back")
             # Nothing was uploaded, so tell the server to stop showing this
             # cell as 解题中 (best-effort; the server also self-heals stale
             # started marks after est x3 with no submission).
@@ -569,10 +572,12 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict]) ->
             prompt = "run it now? [y/N]" + (" (or 's' to skip this one)" if n > 1 else "") + " "
             answer = input(prompt).strip().lower()
             if n > 1 and answer == "s":
-                print("skipped (its lease stays active; `dradar resume` to come back to it)")
+                print("skipped (its lease stays active; `dradar resume` to come back "
+                      "or `dradar release` to give it back)")
                 continue
             if answer != "y":
-                print("aborted (any remaining leases stay active; `dradar resume` to continue)")
+                print("aborted (remaining leases stay active; use `dradar resume` "
+                      "to continue or `dradar release` to give them back)")
                 return 1
         results.append(_run_and_submit(client, assignment, tasks_root, args, local_commit))
     ok = all(o in ("submitted", "interrupted") for o in results)
@@ -592,7 +597,11 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
     results, failed_ids = [], set()
     while True:
         try:
-            data = client.checkout()
+            # A failed local cell is marked stopped so it is retryable later,
+            # but this session must not immediately take the same cell again.
+            # The server applies this exclusion before stamping started_at,
+            # allowing the loop to keep draining other waiting cells.
+            data = client.checkout(exclude_assignment_ids=failed_ids)
         except ApiError as exc:
             if exc.status_code == 404:
                 return None if not results else 0  # old server / endpoint gone
@@ -602,16 +611,19 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             if not results:
                 print("nothing left to start — every held cell is already "
                       "checked out (another session?) or submitted. "
-                      "`dradar status` shows where things stand.")
+                      "`dradar leases` shows exactly what is still held.")
             break
         if assignment["assignment_id"] in failed_ids:
-            # Our own earlier failure re-entered the dispenser (the failure
-            # path reports 'stopped'). Leave it checked out and move on —
-            # retrying the same broken cell in a tight loop helps nobody;
-            # a later `dradar resume` (or another session) can pick it up.
-            print(f"skipping {assignment['task_id']} — it already failed in "
-                  "this session; it stays leased for a later retry")
-            continue
+            # Compatibility with an older server that ignores the exclusion
+            # field: checkout just stamped this cell started again. Undo that
+            # stamp before stopping, otherwise `resume` reports nothing to do
+            # while the UI shows a permanently running cell (incident
+            # 019f656c-cf16-70e2-ae4c-d1d51146acb2, 2026-07-15).
+            _mark_stopped_quietly(client, assignment)
+            print(f"stopping after {assignment['task_id']} re-entered checkout — "
+                  "it already failed in this session. `dradar resume` retries it "
+                  "later; `dradar release` gives it back.")
+            break
         extra = data.get("unstarted")
         print(f"\n=== checked out {assignment['task_id']} "
               f"{assignment['model']}@{assignment['effort']}"
