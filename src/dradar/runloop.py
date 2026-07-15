@@ -128,6 +128,79 @@ def _claim_from_menu(client: ApiClient, menu: list[dict], yes: bool) -> dict | N
     return None
 
 
+def _parse_pick(spec: str) -> tuple[str, str, str]:
+    parts = spec.split(":")
+    if len(parts) != 3:
+        sys.exit(f"--pick expects task_id:model:effort, got {spec!r}")
+    return parts[0], parts[1], parts[2]
+
+
+class _ConcurrentCapHit(Exception):
+    """Raised by _claim_cell when a 409 means the volunteer's own concurrent-
+    hold cap, not a stale/taken cell -- every further claim in the same batch
+    would fail identically, so callers stop instead of repeating the same
+    line N times."""
+
+
+def _claim_cell(client: ApiClient, task_id: str, model: str, effort: str) -> dict | None:
+    """Claim one cell, printing a clear per-cell success/failure line (the
+    acceptance bar from volunteer issue #1: an Agent driving this headlessly
+    needs to know exactly what landed, not just an aggregate count). A stale/
+    taken cell (409) is reported and swallowed -- the caller keeps trying the
+    rest of the batch. Everything else (401, the concurrent-hold cap, a
+    validation error) propagates: _ConcurrentCapHit to the batch loop,
+    anything else to _exit_for."""
+    try:
+        data = client.claim_assignment(task_id, model, effort)
+    except ApiError as exc:
+        if exc.status_code != 409:
+            raise
+        if "already holding" in str(exc):
+            raise _ConcurrentCapHit(str(exc)) from exc
+        print(f"  {task_id}/{model}@{effort}: not claimed ({exc})")
+        return None
+    a = data.get("assignment")
+    if a:
+        print(f"  {task_id}/{model}@{effort}: claimed")
+    return a
+
+
+def _claim_picks(client: ApiClient, specs: list[str]) -> list[dict]:
+    """`dradar go --pick task:model:effort` (repeatable): claim exact cells by
+    ID instead of picking from the web or auto-suggesting."""
+    claimed = []
+    try:
+        for task_id, model, effort in (_parse_pick(s) for s in specs):
+            a = _claim_cell(client, task_id, model, effort)
+            if a is not None:
+                claimed.append(a)
+    except _ConcurrentCapHit as exc:
+        print(f"  stopping — {exc}")
+    return claimed
+
+
+def _claim_auto(client: ApiClient, n: int) -> list[dict]:
+    """`dradar go --auto [N]`: auto-pick + claim up to N cells via the
+    server's weighted-random suggester (/api/v1/suggest — the same primitive
+    behind the web's 雷达随机推荐 button), so a headless/Agent run never needs
+    a prior web claim (volunteer issue #1, 2026-07-15). A suggested cell that
+    went stale between suggest and claim (someone else grabbed it first) is
+    just skipped, not treated as a failure."""
+    cells = client.suggest(n).get("cells") or []
+    if not cells:
+        print("no eligible cells to auto-pick right now")
+        return []
+    claimed = []
+    try:
+        for c in cells:
+            a = _claim_cell(client, c["task_id"], c["model"], c["effort"])
+            if a is not None:
+                claimed.append(a)
+    except _ConcurrentCapHit as exc:
+        print(f"  stopping — {exc}")
+    return claimed
+
+
 def _exit_for(exc: ApiError) -> None:
     """Exit on a dead-end ApiError in the run flow with a next step, not just
     the raw server error. 401 means the token was reset/clobbered — recoverable
@@ -405,6 +478,8 @@ def cmd_retry_upload(args) -> int:
 
 
 def cmd_go(args) -> int:
+    if getattr(args, "pick", None) and getattr(args, "auto", None):
+        sys.exit("--auto and --pick are two different ways to choose cells; pass only one")
     cfg = _load_config()
     client = _client(cfg, auto_register=True)
     tasks_root = cfg.get("tasks_root")
@@ -559,10 +634,26 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path) -> int:
     (web-claimed on free-pick instances, menu-claimed otherwise), explain an
     empty one, hand a non-empty one to _run_batch."""
     active, free_pick = _acquire_batch(client, args.yes)
+    wants = getattr(args, "pick", None) or getattr(args, "auto", None)
+    if active and free_pick and wants:
+        print(f"already holding {len(active)} cell(s) — ignoring --auto/--pick; "
+              "finish those (or `dradar resume`) before claiming more")
+    elif not active and free_pick and wants:
+        # Free-pick instances normally need a prior web claim; --auto/--pick
+        # claim straight from the CLI instead (volunteer issue #1,
+        # 2026-07-15) so an Agent never has to touch the web UI at all.
+        try:
+            active = (_claim_picks(client, args.pick) if getattr(args, "pick", None)
+                      else _claim_auto(client, args.auto))
+        except ApiError as exc:
+            _exit_for(exc)
     if not active:
-        if free_pick:
+        if free_pick and wants:
+            print("nothing claimed — try again, or pick on the radar page instead.")
+        elif free_pick:
             print("no cells claimed — pick some on the radar page, then paste the "
-                  "command it gives you (or run `dradar go` again after claiming).")
+                  "command it gives you (or run `dradar go` again after claiming), "
+                  "or use `dradar go --auto` / `--pick` to claim straight from the CLI.")
         elif getattr(args, "resume", False):
             print("nothing to resume — no active lease (it may have expired). Run `dradar go`.")
         else:

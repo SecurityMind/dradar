@@ -35,6 +35,18 @@ def test_transport_failure_has_no_status_code():
     assert "cannot reach" in str(ei.value)
 
 
+def test_suggest_passes_n_and_returns_cells():
+    seen = {}
+
+    def handler(request):
+        seen["path"] = str(request.url)
+        return httpx.Response(200, json={"cells": [{"task_id": "t1"}]})
+
+    got = _client(handler).suggest(3)
+    assert seen["path"].endswith("/api/v1/suggest?n=3")
+    assert got == {"cells": [{"task_id": "t1"}]}
+
+
 def _do_submit(handler, tmp_path, with_optional):
     patch = tmp_path / "model.patch"
     patch.write_bytes(b"diff --git a/f b/f\n")

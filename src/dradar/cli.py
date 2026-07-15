@@ -76,6 +76,22 @@ def main(argv: list[str] | None = None) -> int:
                  "split the held cells via server-side checkout, but they still "
                  "share this machine's CPU/RAM — expect slower individual runs",
         )
+        if name == "go":
+            # Free-pick instances normally require a prior web claim; these let
+            # `go` claim straight from the CLI instead (no-op if you're already
+            # holding cells) -- for headless/Agent use with no web step at all.
+            p.add_argument(
+                "--auto", nargs="?", const=5, type=int, default=None, metavar="N",
+                help="nothing held? auto-pick up to N cells (default 5, server "
+                     "caps at 10) via the same weighted-random suggester as the "
+                     "radar page's 雷达随机推荐 button, claim them, then run",
+            )
+            p.add_argument(
+                "--pick", action="append", metavar="TASK:MODEL:EFFORT",
+                help="nothing held? claim this exact cell instead of auto-picking "
+                     "(repeatable), then run — e.g. "
+                     "--pick abs-module-cache-flags:gpt-5.6-sol:low",
+            )
         p.set_defaults(func=cmd_go, resume=is_resume, lease_hint=True)
 
     args = parser.parse_args(argv)

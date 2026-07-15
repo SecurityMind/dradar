@@ -119,6 +119,14 @@ class ApiClient:
             data={"task_id": task_id, "model": model, "effort": effort},
         )
 
+    def suggest(self, n: int) -> dict[str, Any]:
+        """Weighted-random candidate cells (server-side balanced_random_cells,
+        biased toward least-tested), same primitive behind the web's 雷达随机
+        推荐 button — powers `dradar go --auto` so a headless/Agent run doesn't
+        need a prior web claim. Returns {cells: [menu-entry dict, ...]};
+        candidates only, not yet claimed."""
+        return self._get(f"/api/v1/suggest?n={n}")
+
     def mark_started(self, assignment_id: str) -> dict[str, Any]:
         """Confirms the trial subprocess actually started (see runner.run_trial):
         extends a free-pick claim's short initial lease out to the normal

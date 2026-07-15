@@ -27,13 +27,16 @@ MENU = [
 
 
 class FakeClient:
-    def __init__(self, assignment_data, claims=None):
+    def __init__(self, assignment_data, claims=None, suggested=None):
         # assignment_data: one payload (repeated), or a list served in order
         # (the last one repeats). claims: scripted claim_assignment results,
         # in order — a dict is returned, an exception instance is raised.
+        # suggested: the cells `suggest()` hands back for --auto.
         self._payloads = assignment_data if isinstance(assignment_data, list) else [assignment_data]
         self._claims = list(claims or [])
+        self._suggested = suggested or []
         self.claim_calls = []
+        self.suggest_calls = []
 
     def get_assignment(self):
         return self._payloads.pop(0) if len(self._payloads) > 1 else self._payloads[0]
@@ -45,15 +48,19 @@ class FakeClient:
             raise result
         return result
 
+    def suggest(self, n):
+        self.suggest_calls.append(n)
+        return {"cells": self._suggested}
+
     def checkout(self):
         # The default fake predates the per-cell dispenser, so callers take
         # the legacy whole-batch path these tests were written against.
         raise ApiError("not found", status_code=404)
 
 
-def _args(yes=True, dev_agent=None):
+def _args(yes=True, dev_agent=None, auto=None, pick=None):
     return argparse.Namespace(yes=yes, dev_agent=dev_agent, resume=False,
-                              allow_task_drift=False, keep=False)
+                              allow_task_drift=False, keep=False, auto=auto, pick=pick)
 
 
 # runloop._run_and_submit and runloop._check_version_pin are the sanctioned
@@ -133,6 +140,91 @@ def test_free_pick_with_no_held_cells_points_to_the_web(monkeypatch, capsys, tmp
     rc = runloop._go_menu(_args(yes=True, dev_agent=None), {}, client, tmp_path)
     out = capsys.readouterr().out
     assert "pick some on the radar page" in out
+    assert rc == 0
+
+
+# --- --auto / --pick: CLI-side claiming for free-pick instances (volunteer -
+# issue #1, 2026-07-15) so an Agent never has to touch the web UI -----------
+
+def test_go_rejects_auto_and_pick_together():
+    with pytest.raises(SystemExit):
+        runloop.cmd_go(argparse.Namespace(pick=["t1:m:e"], auto=5))
+
+
+def test_auto_claims_suggested_cells_and_runs_them(monkeypatch, capsys, tmp_path: Path):
+    ran = []
+    _patch_run(monkeypatch, ran=ran)
+    suggested = [{"task_id": "t1", "model": "m", "effort": "e"},
+                 {"task_id": "t2", "model": "m", "effort": "e"}]
+    claims = [{"assignment": {**ASSIGNMENT, "assignment_id": "a1", "task_id": "t1"}},
+              {"assignment": {**ASSIGNMENT, "assignment_id": "a2", "task_id": "t2"}}]
+    client = FakeClient({"active": [], "free_pick": True, "menu": None},
+                        claims=claims, suggested=suggested)
+    rc = runloop._go_menu(_args(yes=True, auto=2), {}, client, tmp_path)
+    assert client.suggest_calls == [2]
+    assert client.claim_calls == [("t1", "m", "e"), ("t2", "m", "e")]
+    assert ran == ["a1", "a2"]
+    out = capsys.readouterr().out
+    assert "t1/m@e: claimed" in out and "t2/m@e: claimed" in out
+    assert rc == 0
+
+
+def test_auto_skips_a_stale_suggestion_and_keeps_going(monkeypatch, capsys, tmp_path: Path):
+    ran = []
+    _patch_run(monkeypatch, ran=ran)
+    suggested = [{"task_id": "t1", "model": "m", "effort": "e"},
+                 {"task_id": "t2", "model": "m", "effort": "e"}]
+    claims = [ApiError("cell no longer available, fetch a fresh menu", status_code=409),
+              {"assignment": {**ASSIGNMENT, "assignment_id": "a2", "task_id": "t2"}}]
+    client = FakeClient({"active": [], "free_pick": True, "menu": None},
+                        claims=claims, suggested=suggested)
+    rc = runloop._go_menu(_args(yes=True, auto=2), {}, client, tmp_path)
+    assert ran == ["a2"]                    # t1 skipped, t2 claimed and ran
+    out = capsys.readouterr().out
+    assert "t1/m@e: not claimed" in out
+    assert rc == 0
+
+
+def test_auto_stops_clean_at_the_concurrent_cap(monkeypatch, capsys, tmp_path: Path):
+    suggested = [{"task_id": "t1", "model": "m", "effort": "e"},
+                 {"task_id": "t2", "model": "m", "effort": "e"}]
+    claims = [ApiError("you're already holding 10 cells (max 10) — run or finish "
+                       "some before claiming more", status_code=409)]
+    client = FakeClient({"active": [], "free_pick": True, "menu": None},
+                        claims=claims, suggested=suggested)
+    rc = runloop._go_menu(_args(yes=True, auto=2), {}, client, tmp_path)
+    assert client.claim_calls == [("t1", "m", "e")]   # never tried t2 — cap already hit
+    out = capsys.readouterr().out
+    assert "stopping —" in out and "already holding" in out
+    assert rc == 0
+
+
+def test_pick_claims_exact_cells_by_id(monkeypatch, tmp_path: Path):
+    ran = []
+    _patch_run(monkeypatch, ran=ran)
+    claims = [{"assignment": {**ASSIGNMENT, "assignment_id": "a1", "task_id": "t1"}}]
+    client = FakeClient({"active": [], "free_pick": True, "menu": None}, claims=claims)
+    rc = runloop._go_menu(_args(yes=True, pick=["t1:m:e"]), {}, client, tmp_path)
+    assert client.claim_calls == [("t1", "m", "e")]
+    assert ran == ["a1"]
+    assert rc == 0
+
+
+def test_pick_malformed_spec_exits_clearly():
+    with pytest.raises(SystemExit):
+        runloop._parse_pick("not-enough-colons")
+
+
+def test_auto_and_pick_are_ignored_once_something_is_already_held(monkeypatch, capsys, tmp_path: Path):
+    ran = []
+    _patch_run(monkeypatch, ran=ran)
+    batch = [{**ASSIGNMENT, "assignment_id": "a1", "task_id": "t1"}]
+    client = FakeClient({"active": batch, "free_pick": True, "menu": None})
+    rc = runloop._go_menu(_args(yes=True, auto=5), {}, client, tmp_path)
+    assert client.suggest_calls == []        # never called -- already holding cells
+    assert ran == ["a1"]                     # the already-held batch still ran
+    out = capsys.readouterr().out
+    assert "already holding 1 cell(s) — ignoring --auto/--pick" in out
     assert rc == 0
 
 
