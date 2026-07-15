@@ -7,10 +7,12 @@ pre_artifacts.sh, then downloaded by pier into the trial dir.
 
 import glob
 import json
+import math
 import os
 import shutil
 import subprocess
 import time
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,6 +95,42 @@ def _ensure_allowlist(home: Path) -> Path:
     return path
 
 
+def _task_agent_timeout_sec(task_path: Path) -> float | None:
+    """The task's own declared agent watchdog (task.toml's [agent].timeout_sec
+    -- currently 5400.0/90min flat across the whole deep-swe set). None if the
+    file is missing or malformed; caller must not guess a number in that case."""
+    try:
+        with (task_path / "task.toml").open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    return data.get("agent", {}).get("timeout_sec")
+
+
+def _agent_timeout_multiplier(assignment: dict, task_path: Path) -> float:
+    """pier's own inner agent watchdog must never fire before DRadar's outer
+    one (_trial_timeout_sec, which scales with the server's per-cell
+    estimate) -- otherwise a long, healthy trial gets killed by pier itself
+    well before DRadar's watchdog would ever trigger (volunteer report,
+    2026-07-15: a 68-min-estimated ultra cell, outer-allowed ~272 min, killed
+    by pier's flat 90-min inner timeout because build_pier_command never told
+    pier to stretch it). Only ever stretches pier's timeout, never shrinks it
+    below the task's own declared default; +60s of slack keeps DRadar's outer
+    watchdog the one that actually fires on a truly wedged run, not a
+    same-instant race with pier's."""
+    base = _task_agent_timeout_sec(task_path)
+    if not base:
+        return 1.0
+    raw = (_trial_timeout_sec(assignment) + 60) / base
+    if raw <= 1.0:
+        return 1.0
+    # Round UP to 3 decimals: --agent-timeout-multiplier is formatted to the
+    # same precision, and rounding to nearest/down could shave the product
+    # back under (outer + 60), silently reopening the exact race this exists
+    # to close.
+    return math.ceil(raw * 1000) / 1000
+
+
 def build_pier_command(
     assignment: dict,
     tasks_root: Path,
@@ -121,6 +159,9 @@ def build_pier_command(
         "--disable-verification",
         "--yes",
     ]
+    multiplier = _agent_timeout_multiplier(assignment, task_path)
+    if multiplier > 1.0:
+        cmd += ["--agent-timeout-multiplier", f"{multiplier:.3f}"]
     # Task containers ship no git identity, so an agent's final `git commit`
     # dies with "Author identity unknown" unless the model thinks to configure
     # one (volunteer report, 2026-07-13). These ride pier's --ae into the

@@ -41,6 +41,84 @@ def test_claude_code_disallows_web_tools(tmp_path, monkeypatch):
     assert "WebSearch" in CLAUDE_DISALLOWED_TOOLS and "WebFetch" in CLAUDE_DISALLOWED_TOOLS
 
 
+# --- pier's inner agent timeout must never undercut DRadar's own outer one --
+# (volunteer report #4, 2026-07-15: task.toml declares a flat 5400s/90min
+# agent timeout across the whole deep-swe set; DRadar's own outer watchdog
+# scales up to 4x the server's estimate, but build_pier_command never told
+# pier to stretch its OWN timeout to match, so pier killed long/heavy cells
+# far before DRadar's watchdog ever would have).
+
+def _task_with_toml(tmp_path, task_id="t", timeout_sec=5400.0):
+    task = tmp_path / task_id
+    task.mkdir()
+    (task / "task.toml").write_text(f"[agent]\ntimeout_sec = {timeout_sec}\n")
+    return task
+
+
+def test_task_agent_timeout_sec_reads_task_toml(tmp_path):
+    task = _task_with_toml(tmp_path, timeout_sec=5400.0)
+    assert runner_mod._task_agent_timeout_sec(task) == 5400.0
+
+
+def test_task_agent_timeout_sec_none_when_missing(tmp_path):
+    task = tmp_path / "no-toml"
+    task.mkdir()
+    assert runner_mod._task_agent_timeout_sec(task) is None
+
+
+def test_task_agent_timeout_sec_none_when_malformed(tmp_path):
+    task = tmp_path / "bad-toml"
+    task.mkdir()
+    (task / "task.toml").write_text("this is not [ valid toml")
+    assert runner_mod._task_agent_timeout_sec(task) is None
+
+
+def test_multiplier_stretches_pier_to_match_drader_outer_cap(tmp_path):
+    # est_minutes=68 -> outer = max(1800, 68*60*4) = 16320s; base 5400s ->
+    # pier must be stretched so its own timeout is >= outer, plus slack.
+    task = _task_with_toml(tmp_path, timeout_sec=5400.0)
+    assignment = {"est_minutes": 68}
+    m = runner_mod._agent_timeout_multiplier(assignment, task)
+    assert m > 1.0
+    assert m * 5400.0 >= 16320 + 60
+
+
+def test_multiplier_never_shrinks_below_one(tmp_path):
+    # A short-estimate cell: outer cap (1800s floor) is well under the task's
+    # own 5400s default -- must NOT ask pier to shrink its own timeout.
+    task = _task_with_toml(tmp_path, timeout_sec=5400.0)
+    assignment = {"est_minutes": 5}
+    assert runner_mod._agent_timeout_multiplier(assignment, task) == 1.0
+
+
+def test_multiplier_is_one_without_task_toml(tmp_path):
+    task = tmp_path / "no-toml"
+    task.mkdir()
+    assert runner_mod._agent_timeout_multiplier({"est_minutes": 200}, task) == 1.0
+
+
+def test_build_pier_command_passes_multiplier_for_long_estimate(tmp_path, monkeypatch):
+    _stub_pier(monkeypatch)
+    task = _task_with_toml(tmp_path, task_id="abs-module-cache-flags", timeout_sec=5400.0)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
+    a = _assignment("claude-code", model="claude-sonnet-5", effort="high")
+    a["est_minutes"] = 68
+    cmd = build_pier_command(a, tmp_path, tmp_path / "jobs", "j", tmp_path / "home")
+    assert "--agent-timeout-multiplier" in cmd
+    got = float(cmd[cmd.index("--agent-timeout-multiplier") + 1])
+    assert got * 5400.0 >= 16320 + 60
+
+
+def test_build_pier_command_omits_multiplier_for_short_estimate(tmp_path, monkeypatch):
+    _stub_pier(monkeypatch)
+    task = _task_with_toml(tmp_path, task_id="abs-module-cache-flags", timeout_sec=5400.0)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
+    a = _assignment("claude-code", model="claude-sonnet-5", effort="high")
+    a["est_minutes"] = 5
+    cmd = build_pier_command(a, tmp_path, tmp_path / "jobs", "j", tmp_path / "home")
+    assert "--agent-timeout-multiplier" not in cmd
+
+
 # --- self-bootstrap (ensure_pier / ensure_tasks_root) ------------------------
 import subprocess
 from pathlib import Path
