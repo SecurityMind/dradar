@@ -4,3 +4,43 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 uv.lock
+
+# Local DRadar/Pier runtime state. Checkpoints can contain large mutable
+# worktrees and resumable agent-session state; they are machine-local data,
+# never source artifacts.
+.dradar/work/jobs/
+.dradar/checkpoint-locks/
+.pier-jobs/
+
+# Local credentials and machine-specific configuration.
+.env
+.env.*
+!.env.example
+
+# Test, type-check, coverage, and build output.
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+build/
+dist/
+
+# Runtime databases, logs, and process state.
+*.log
+*.pid
+*.sock
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+
+# OS/editor metadata.
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
