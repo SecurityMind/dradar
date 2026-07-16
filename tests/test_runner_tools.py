@@ -119,6 +119,35 @@ def test_build_pier_command_omits_multiplier_for_short_estimate(tmp_path, monkey
     assert "--agent-timeout-multiplier" not in cmd
 
 
+def test_codex_command_enables_credential_free_checkpoint_metadata(tmp_path, monkeypatch):
+    _stub_pier(monkeypatch)
+    task = tmp_path / "task"
+    task.mkdir()
+    auth = tmp_path / "auth.json"
+    auth.write_text("{}")
+    (tmp_path / "home").mkdir()
+    monkeypatch.setenv("CODEX_AUTH_JSON_PATH", str(auth))
+    resume = tmp_path / "previous" / "checkpoint"
+    a = _assignment("codex") | {
+        "assignment_id": "a123", "task_id": "task",
+        "resume_generation": 3,
+    }
+    cmd = build_pier_command(
+        a, tmp_path, tmp_path / "jobs", "j", tmp_path / "home",
+        resume_checkpoint=resume,
+    )
+    agent_values = [cmd[i + 1] for i, value in enumerate(cmd[:-1]) if value == "--ak"]
+    assert "checkpoint_enabled=true" in agent_values
+    assert "checkpoint_assignment_id=a123" in agent_values
+    assert "checkpoint_task_id=task" in agent_values
+    assert "checkpoint_resume_generation=3" in agent_values
+    assert f"checkpoint_path={resume}" in agent_values
+    # Auth is injected separately into the ephemeral container, never encoded
+    # in the persistent checkpoint metadata.
+    assert not any("auth" in value.lower() or "token" in value.lower()
+                   for value in agent_values if value.startswith("checkpoint_"))
+
+
 # --- self-bootstrap (ensure_pier / ensure_tasks_root) ------------------------
 import subprocess
 from pathlib import Path

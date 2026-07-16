@@ -100,6 +100,30 @@ def test_mark_stopped_requests_cross_session_cooldown():
     assert b"defer_seconds=300" in seen["body"]
 
 
+def test_checkpoint_protocol_sends_id_generation_and_runner_session():
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, request.read()))
+        if request.url.path.endswith("/resume"):
+            return httpx.Response(200, json={"assignment": {"assignment_id": "a1"}})
+        return httpx.Response(200, json={"ok": True})
+
+    client = _client(handler)
+    client.checkpoint_pause("a1", "checkpoint-123", 2)
+    client.checkpoint_resume("a1", "checkpoint-123", 2, session_id="session-123")
+    client.checkpoint_discard("a1", "checkpoint-123", 3, reason="invalid")
+    assert [path for path, _ in seen] == [
+        "/api/v1/assignment/checkpoint/pause",
+        "/api/v1/assignment/checkpoint/resume",
+        "/api/v1/assignment/checkpoint/discard",
+    ]
+    assert all(b"checkpoint_id=checkpoint-123" in body for _, body in seen)
+    assert b"resume_generation=2" in seen[0][1]
+    assert b"session_id=session-123" in seen[1][1]
+    assert b"reason=invalid" in seen[2][1]
+
+
 def _do_submit(handler, tmp_path, with_optional):
     patch = tmp_path / "model.patch"
     patch.write_bytes(b"diff --git a/f b/f\n")
@@ -141,6 +165,22 @@ def test_submit_sends_three_parts_and_client_meta_as_json_string(tmp_path):
         assert part in body
     # client_meta travels as a single JSON-encoded string form field
     assert json.dumps({"dradar_version": "0.test"}).encode() in body
+
+
+def test_submit_sends_resume_generation_when_fenced(tmp_path):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = request.read()
+        return httpx.Response(200, json={"submission_id": "s1", "grade_status": "pending"})
+
+    patch = tmp_path / "model.patch"
+    patch.write_text("diff")
+    _client(handler).submit(
+        "a1", "nonce", patch, None, None, {}, resume_generation=7,
+    )
+    assert b"resume_generation" in seen["body"]
+    assert b"7" in seen["body"]
 
 
 def test_tokenless_client_sends_no_authorization_header():

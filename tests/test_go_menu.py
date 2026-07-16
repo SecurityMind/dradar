@@ -394,7 +394,8 @@ class SubmitClient(FakeClient):
         super().__init__(assignment_data, claims)
         self.submissions = []
 
-    def submit(self, assignment_id, nonce, patch, trajectory, result, meta, outcome="completed"):
+    def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+               outcome="completed", resume_generation=None):
         self.submissions.append(
             {"assignment_id": assignment_id, "outcome": outcome, "meta": meta})
         return {"submission_id": f"s-{assignment_id}", "grade_status": "pending"}
