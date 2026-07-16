@@ -120,6 +120,30 @@ def test_checkout_loop_never_retries_a_cell_that_failed_this_session(
     assert rc == 1                            # the failure still fails the run
 
 
+def test_checkout_loop_fuses_after_interrupted_trial(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("DRADAR_BATCH_FAIL_FAST", "1")
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    attempts = []
+
+    def run(client, assignment, *a, **kw):
+        attempts.append(assignment["assignment_id"])
+        return "interrupted"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    client = CheckoutClient(
+        {"active": [_cell("network-failure")], "free_pick": True},
+        [{"assignment": _cell("network-failure"), "held": 2, "unstarted": 1},
+         {"assignment": _cell("must-not-run"), "held": 2, "unstarted": 0}],
+    )
+
+    rc = runloop._go_menu(_args(), {}, client, tmp_path)
+
+    assert rc == 0
+    assert attempts == ["network-failure"]
+    assert len(client._checkouts) == 1
+    assert "stopping this batch runner" in capsys.readouterr().out
+
+
 def test_old_server_redispatching_failed_cell_is_unstamped_before_exit(
         monkeypatch, capsys, tmp_path):
     # Regression for case 019f656c-cf16-70e2-ae4c-d1d51146acb2: an old

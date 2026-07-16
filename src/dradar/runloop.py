@@ -10,6 +10,7 @@ someone else with nothing counted. Split out of cli.py to separate this from
 identity (login/register) and doctor (environment checks) concerns.
 """
 
+import os
 import shutil
 import sys
 import tempfile
@@ -848,6 +849,8 @@ def cmd_checkpoint_discard(args) -> int:
 def cmd_go(args) -> int:
     if getattr(args, "pick", None) and getattr(args, "auto", None):
         sys.exit("--auto and --pick are two different ways to choose cells; pass only one")
+    if getattr(args, "auto", None) is not None and args.auto < 1:
+        sys.exit("--auto N requires N >= 1")
     cfg = _load_config()
     client = _client(cfg, auto_register=True)
     tasks_root = cfg.get("tasks_root")
@@ -1067,6 +1070,18 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             client, assignment, tasks_root, args, local_commit, telemetry=telemetry)
         if telemetry:
             telemetry.set_phase("queued")
+        fail_fast = os.environ.get("DRADAR_BATCH_FAIL_FAST", "").lower() in {
+            "1", "true", "yes", "on",
+        }
+        if fail_fast and outcome != "submitted":
+            # Large operator-managed batches should fail closed: continuing to
+            # drain the queue turned one shared proxy incident into 27 invalid
+            # submissions on 2026-07-16. Keep ordinary volunteer behavior
+            # unchanged unless the dedicated batch launcher opts in.
+            print(f"stopping this batch runner after outcome={outcome} — fix "
+                  "the shared agent/network issue before resuming")
+            results.append(outcome)
+            break
         if outcome == "failed":
             failed_ids.add(assignment["assignment_id"])
         results.append(outcome)
@@ -1080,17 +1095,31 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
     (web-claimed on free-pick instances, menu-claimed otherwise), explain an
     empty one, hand a non-empty one to _run_batch."""
     active, free_pick = _acquire_batch(client, args.yes)
-    wants = getattr(args, "pick", None) or getattr(args, "auto", None)
-    if active and free_pick and wants:
-        print(f"already holding {len(active)} cell(s) — ignoring --auto/--pick; "
-              "finish those (or `dradar resume`) before claiming more")
+    wants_pick = getattr(args, "pick", None)
+    auto_target = getattr(args, "auto", None)
+    wants = wants_pick or auto_target is not None
+    if active and free_pick and wants_pick:
+        print(f"already holding {len(active)} cell(s) — ignoring --pick; "
+              "finish those (or `dradar resume`) before claiming exact cells")
+    elif free_pick and auto_target is not None:
+        # --auto is a target batch size, not "claim N more": preserve existing
+        # leases and ask only for the shortfall. The server keeps the ordinary
+        # account cap while configured super accounts may request larger pools.
+        missing = max(0, auto_target - len(active))
+        if missing:
+            try:
+                active += _claim_auto(client, missing)
+            except ApiError as exc:
+                _exit_for(exc)
+        else:
+            print(f"already holding {len(active)} cell(s) — --auto target "
+                  f"{auto_target} already met")
     elif not active and free_pick and wants:
         # Free-pick instances normally need a prior web claim; --auto/--pick
         # claim straight from the CLI instead (volunteer issue #1,
         # 2026-07-15) so an Agent never has to touch the web UI at all.
         try:
-            active = (_claim_picks(client, args.pick) if getattr(args, "pick", None)
-                      else _claim_auto(client, args.auto))
+            active = _claim_picks(client, args.pick)
         except ApiError as exc:
             _exit_for(exc)
     if not active:

@@ -112,9 +112,9 @@ def main(argv: list[str] | None = None) -> int:
             # holding cells) -- for headless/Agent use with no web step at all.
             p.add_argument(
                 "--auto", nargs="?", const=5, type=int, default=None, metavar="N",
-                help="nothing held? auto-pick up to N cells (default 5, server "
-                     "caps at 10) via the same weighted-random suggester as the "
-                     "radar page's 雷达随机推荐 button, claim them, then run",
+                help="top up the held batch to N cells (default 5) via the same "
+                     "weighted-random suggester as the radar page's 雷达随机推荐 "
+                     "button, then run; the server enforces account-specific limits",
             )
             p.add_argument(
                 "--pick", action="append", metavar="TASK:MODEL:EFFORT",

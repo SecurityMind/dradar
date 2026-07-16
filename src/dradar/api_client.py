@@ -124,7 +124,8 @@ class ApiClient:
         biased toward least-tested), same primitive behind the web's 雷达随机
         推荐 button — powers `dradar go --auto` so a headless/Agent run doesn't
         need a prior web claim. Returns {cells: [menu-entry dict, ...]};
-        candidates only, not yet claimed."""
+        candidates only, not yet claimed. The server applies ordinary/super
+        account-specific recommendation limits."""
         return self._get(f"/api/v1/suggest?n={n}")
 
     def mark_started(

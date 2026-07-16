@@ -151,6 +151,11 @@ def test_go_rejects_auto_and_pick_together():
         runloop.cmd_go(argparse.Namespace(pick=["t1:m:e"], auto=5))
 
 
+def test_go_rejects_nonpositive_auto():
+    with pytest.raises(SystemExit, match="N >= 1"):
+        runloop.cmd_go(argparse.Namespace(pick=None, auto=0))
+
+
 def test_auto_claims_suggested_cells_and_runs_them(monkeypatch, capsys, tmp_path: Path):
     ran = []
     _patch_run(monkeypatch, ran=ran)
@@ -215,17 +220,32 @@ def test_pick_malformed_spec_exits_clearly():
         runloop._parse_pick("not-enough-colons")
 
 
-def test_auto_and_pick_are_ignored_once_something_is_already_held(monkeypatch, capsys, tmp_path: Path):
+def test_auto_tops_up_an_existing_batch_to_the_requested_size(monkeypatch, capsys, tmp_path: Path):
     ran = []
     _patch_run(monkeypatch, ran=ran)
     batch = [{**ASSIGNMENT, "assignment_id": "a1", "task_id": "t1"}]
-    client = FakeClient({"active": batch, "free_pick": True, "menu": None})
+    suggested = [{"task_id": f"t{i}", "model": "m", "effort": "e"}
+                 for i in range(2, 6)]
+    claims = [{"assignment": {**ASSIGNMENT, "assignment_id": f"a{i}",
+                              "task_id": f"t{i}"}} for i in range(2, 6)]
+    client = FakeClient({"active": batch, "free_pick": True, "menu": None},
+                        claims=claims, suggested=suggested)
     rc = runloop._go_menu(_args(yes=True, auto=5), {}, client, tmp_path)
-    assert client.suggest_calls == []        # never called -- already holding cells
-    assert ran == ["a1"]                     # the already-held batch still ran
-    out = capsys.readouterr().out
-    assert "already holding 1 cell(s) — ignoring --auto/--pick" in out
+    assert client.suggest_calls == [4]
+    assert ran == ["a1", "a2", "a3", "a4", "a5"]
     assert rc == 0
+
+
+def test_auto_does_not_claim_when_existing_batch_meets_target(monkeypatch, capsys, tmp_path: Path):
+    ran = []
+    _patch_run(monkeypatch, ran=ran)
+    batch = [{**ASSIGNMENT, "assignment_id": f"a{i}", "task_id": f"t{i}"}
+             for i in range(1, 4)]
+    client = FakeClient({"active": batch, "free_pick": True, "menu": None})
+    assert runloop._go_menu(_args(yes=True, auto=2), {}, client, tmp_path) == 0
+    assert client.suggest_calls == []
+    assert ran == ["a1", "a2", "a3"]
+    assert "--auto target 2 already met" in capsys.readouterr().out
 
 
 def test_skip_in_a_batch_moves_to_the_next_cell(monkeypatch, capsys, tmp_path: Path):
