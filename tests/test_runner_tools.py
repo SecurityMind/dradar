@@ -184,6 +184,15 @@ def test_ensure_pier_noop_when_required_version_present(monkeypatch):
     assert called == []            # approved build -> never installs
 
 
+def test_ensure_pier_accepts_newer_compatible_post_release(monkeypatch):
+    monkeypatch.setattr(runner_mod.shutil, "which", lambda n: "/usr/bin/pier")
+    monkeypatch.setattr(runner_mod, "_pier_version", lambda _: "0.3.0.post3")
+    called = []
+    monkeypatch.setattr(runner_mod.subprocess, "run", lambda *a, **k: called.append(a))
+    ensure_pier()
+    assert called == []
+
+
 def test_ensure_pier_installs_via_uv_when_missing(monkeypatch):
     seen = {"pier": None}  # pier missing first, present after "install"
     def which(name):
