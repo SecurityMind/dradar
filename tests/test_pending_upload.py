@@ -2,6 +2,7 @@
 disk and be retryable without re-running, via a local pending-upload ledger.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -74,7 +75,8 @@ class FakeClient:
         self.behavior = behavior  # callable(assignment_id) -> dict | raises ApiError
         self.calls = []
 
-    def submit(self, assignment_id, nonce, patch, trajectory, result, meta, outcome="completed"):
+    def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+               outcome="completed", resume_generation=None):
         self.calls.append(assignment_id)
         return self.behavior(assignment_id)
 
@@ -105,6 +107,36 @@ def test_upload_success_clears_ledger(tmp_path: Path, monkeypatch):
     assert pending.load(tmp_path) == []
 
 
+def test_upload_success_removes_current_and_superseded_checkpoint_jobs(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    aid = "1" * 32
+    jobs = []
+    for suffix in ("old", "new"):
+        job = tmp_path / "work" / "jobs" / f"a{aid}-{suffix}"
+        checkpoint = job / f"task__{suffix}" / "agent" / "checkpoint"
+        checkpoint.mkdir(parents=True)
+        (checkpoint / "checkpoint.json").write_text(json.dumps({
+            "schema_version": 1, "checkpoint_id": f"checkpoint-{suffix}12345678",
+            "assignment_id": aid, "phase": "agent_completed",
+            "created_at": "2026-07-16T00:00:00Z",
+            "updated_at": "2026-07-16T01:00:00Z",
+            "resume_generation": 1,
+        }))
+        jobs.append(job)
+    trial_dir = jobs[-1] / "task__new"
+    (trial_dir / "artifacts").mkdir(parents=True)
+    (trial_dir / "artifacts" / "model.patch").write_text("diff --git a b\n")
+    client = FakeClient(lambda aid_: {"submission_id": "s1", "grade_status": "pending"})
+    outcome = runloop._upload_trial(client, _entry(
+        trial_dir, assignment_id=aid, job_dir=str(jobs[-1]), keep=False,
+        resume_generation=1,
+    ))
+    assert outcome == "submitted"
+    assert not any(job.exists() for job in jobs)
+
+
 def test_upload_failure_records_ledger_entry(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     trial_dir = _make_trial_dir(tmp_path)
@@ -132,6 +164,25 @@ def test_upload_409_means_already_landed_clears_ledger(tmp_path: Path, monkeypat
     outcome = runloop._upload_trial(client, _entry(trial_dir))
     assert outcome == "submitted"
     assert pending.load(tmp_path) == []
+
+
+def test_stale_generation_409_is_not_misread_as_already_submitted(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+
+    def stale(aid):
+        raise ApiError(
+            "server returned 409: stale recovery generation; current generation is 2",
+            status_code=409,
+        )
+
+    outcome = runloop._upload_trial(
+        FakeClient(stale), _entry(trial_dir, resume_generation=1),
+    )
+    assert outcome == "upload-failed"
+    assert len(pending.load(tmp_path)) == 1
 
 
 def test_upload_410_means_expired_clears_ledger(tmp_path: Path, monkeypatch):

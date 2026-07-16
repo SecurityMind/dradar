@@ -211,6 +211,36 @@ class ApiClient:
             data={"assignment_id": assignment_id, "defer_seconds": "300"},
         )
 
+    def checkpoint_pause(
+        self, assignment_id: str, checkpoint_id: str, resume_generation: int,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/api/v1/assignment/checkpoint/pause",
+            data={"assignment_id": assignment_id, "checkpoint_id": checkpoint_id,
+                  "resume_generation": str(resume_generation)},
+        )
+
+    def checkpoint_resume(
+        self, assignment_id: str, checkpoint_id: str, resume_generation: int,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/api/v1/assignment/checkpoint/resume",
+            data={"assignment_id": assignment_id, "checkpoint_id": checkpoint_id,
+                  "resume_generation": str(resume_generation),
+                  "session_id": session_id or ""},
+        )
+
+    def checkpoint_discard(
+        self, assignment_id: str, checkpoint_id: str, resume_generation: int,
+        reason: str = "user_discard",
+    ) -> dict[str, Any]:
+        return self._post(
+            "/api/v1/assignment/checkpoint/discard",
+            data={"assignment_id": assignment_id, "checkpoint_id": checkpoint_id,
+                  "resume_generation": str(resume_generation), "reason": reason},
+        )
+
     def submit(
         self,
         assignment_id: str,
@@ -220,6 +250,7 @@ class ApiClient:
         result: Path | None,
         client_meta: dict[str, Any],
         outcome: str = "completed",
+        resume_generation: int | None = None,
     ) -> dict[str, Any]:
         files: list[tuple[str, tuple[str, bytes]]] = [
             ("patch", ("model.patch", patch.read_bytes())),
@@ -228,13 +259,16 @@ class ApiClient:
             files.append(("trajectory", ("trajectory.json", trajectory.read_bytes())))
         if result and result.exists():
             files.append(("result", ("result.json", result.read_bytes())))
+        data = {
+            "assignment_id": assignment_id,
+            "nonce": nonce,
+            "outcome": outcome,
+            "client_meta": json.dumps(client_meta),
+        }
+        if resume_generation is not None:
+            data["resume_generation"] = str(resume_generation)
         return self._post(
             "/api/v1/submissions",
-            data={
-                "assignment_id": assignment_id,
-                "nonce": nonce,
-                "outcome": outcome,
-                "client_meta": json.dumps(client_meta),
-            },
+            data=data,
             files=files,
         )

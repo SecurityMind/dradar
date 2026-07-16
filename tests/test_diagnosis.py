@@ -82,7 +82,7 @@ def test_diagnose_empty_without_exception(tmp_path):
 
 class InvalidAckClient(SubmitClient):
     def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
-               outcome="completed"):
+               outcome="completed", resume_generation=None):
         super().submit(assignment_id, nonce, patch, trajectory, result, meta,
                        outcome=outcome)
         return {"submission_id": f"s-{assignment_id}", "grade_status": "invalid"}

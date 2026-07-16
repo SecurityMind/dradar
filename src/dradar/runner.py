@@ -162,6 +162,7 @@ def build_pier_command(
     job_name: str,
     home: Path,
     dev_agent: str | None = None,
+    resume_checkpoint: Path | None = None,
 ) -> list[str]:
     pier = shutil.which("pier")
     if not pier:
@@ -204,8 +205,15 @@ def build_pier_command(
             "--model", assignment["model"],
             "--ak", f"reasoning_effort={assignment['effort']}",
             "--ak", f"config_toml_file={allowlist}",
+            "--ak", "checkpoint_enabled=true",
+            "--ak", f"checkpoint_assignment_id={assignment['assignment_id']}",
+            "--ak", f"checkpoint_task_id={assignment['task_id']}",
+            "--ak", f"checkpoint_effort={assignment['effort']}",
+            "--ak", f"checkpoint_resume_generation={assignment.get('resume_generation', 0)}",
             "--ae", f"CODEX_AUTH_JSON_PATH={auth}",
         ]
+        if resume_checkpoint is not None:
+            cmd += ["--ak", f"checkpoint_path={resume_checkpoint}"]
         # Server-pinned agent version. pier bakes `npm install -g
         # @openai/codex@latest` into a Docker layer, so "latest" freezes at
         # whenever THIS machine first built the image — stale images then
@@ -275,11 +283,11 @@ def local_deep_swe_commit(tasks_root: Path) -> str | None:
 # The (public) task repo. Self-bootstrap clones it so a volunteer never has to.
 DEEP_SWE_REPO = "https://github.com/datacurve-ai/deep-swe"
 
-# Temporary SecurityMind Pier build containing the model-capacity session-resume
-# fix from datacurve-ai/pier#23. Keep the immutable commit pin until the fix is
-# released upstream, then replace this with the official minimum version.
-PIER_VERSION = "0.3.0.post1"
-PIER_COMMIT = "7c121ef84bc5119729acebff36a49188dc9036c1"
+# Temporary SecurityMind Pier build containing datacurve-ai/pier#23 plus
+# persistent workspace/Codex-session checkpoints. Keep the immutable commit
+# pin until both fixes are released upstream, then follow the official tag.
+PIER_VERSION = "0.3.0.post2"
+PIER_COMMIT = "e204586dc21a36eff12cfb34303d6c54ab1e0a3e"
 PIER_SPEC = (
     "datacurve-pier @ git+https://github.com/SecurityMind/pier.git@"
     f"{PIER_COMMIT}"
@@ -300,7 +308,7 @@ def _pier_version(pier: str) -> str | None:
 
 
 def ensure_pier() -> None:
-    """Ensure the pinned Pier build with capacity-resume support is active."""
+    """Ensure the pinned Pier build with persistent-resume support is active."""
     pier = shutil.which("pier")
     installed_version = _pier_version(pier) if pier else None
     if installed_version == PIER_VERSION:
@@ -311,7 +319,7 @@ def ensure_pier() -> None:
             f"Pier {PIER_VERSION} is required but uv is missing -- install uv first: "
             "curl -LsSf https://astral.sh/uv/install.sh | sh")
     if pier:
-        print(f"Pier {installed_version or 'unknown'} lacks capacity resume — "
+        print(f"Pier {installed_version or 'unknown'} lacks persistent resume — "
               f"installing SecurityMind build {PIER_VERSION}...")
     else:
         print(f"pier not found — installing SecurityMind build {PIER_VERSION}...")
@@ -417,6 +425,7 @@ def run_trial(
     work_dir: Path,
     dev_agent: str | None = None,
     on_started: Callable[[], None] | None = None,
+    resume_checkpoint: Path | None = None,
 ) -> TrialArtifacts:
     work_dir.mkdir(parents=True, exist_ok=True)
     jobs_dir = work_dir / "jobs"
@@ -432,7 +441,14 @@ def run_trial(
     # `interrupted` -> the server marks it invalid and the cell reopens.
     timeout_sec = _trial_timeout_sec(assignment)
 
-    cmd = build_pier_command(assignment, tasks_root, jobs_dir, job_name, work_dir, dev_agent)
+    if resume_checkpoint is None:
+        cmd = build_pier_command(
+            assignment, tasks_root, jobs_dir, job_name, work_dir, dev_agent)
+    else:
+        cmd = build_pier_command(
+            assignment, tasks_root, jobs_dir, job_name, work_dir,
+            dev_agent, resume_checkpoint=resume_checkpoint,
+        )
     env = dict(os.environ)
     if on_started is not None:
         # Best-effort by design: this only confirms to the server that a

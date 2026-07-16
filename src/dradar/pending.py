@@ -9,10 +9,11 @@ scrubbing writes to a fresh tempdir and never mutates the originals) plus the
 already-built client_meta and outcome. `dradar retry-upload` (and an
 automatic scan at the top of `dradar go`) replays the upload later.
 
-Entries are self-pruning: a retry that gets back 409 (already submitted —
-some earlier attempt actually landed) or 410 (lease expired — unsalvageable,
-the cell already reopened for someone else) removes the entry. Anything else
-keeps it for the next retry.
+Entries are self-pruning: a retry that gets back 409 specifically saying
+"already submitted" (some earlier attempt actually landed) or 410 (lease
+expired — unsalvageable, the cell already reopened for someone else) removes
+the entry. A 409 recovery-generation conflict is not success and stays queued.
+Anything else keeps it for the next retry.
 """
 
 import json

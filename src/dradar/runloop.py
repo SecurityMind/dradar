@@ -15,7 +15,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, pending
+from . import __version__, checkpoints, pending
 from .api_client import ApiClient, ApiError
 from .identity import _client
 from .local_config import HOME, _load_config
@@ -267,8 +267,9 @@ def _upload_trial(client: ApiClient, entry: dict) -> str:
     The entry is recorded in the local pending-upload ledger BEFORE the
     submit attempt, so a process death mid-upload (Ctrl-C/kill/OOM during a
     large multipart POST) can't orphan a completed, quota-burning trial.
-    Every exit settles it: success/409/410 remove the entry, anything else
-    keeps it for retry. The raw trial_dir is never touched by scrubbing
+    Every exit settles it: success, 409 "already submitted", and 410 remove
+    the entry; fencing conflicts and transient errors keep it for retry. The
+    raw trial_dir is never touched by scrubbing
     (which writes to a fresh tempdir), so a later retry re-scrubs from the
     same untouched originals."""
     assignment_id = entry["assignment_id"]
@@ -276,10 +277,29 @@ def _upload_trial(client: ApiClient, entry: dict) -> str:
     outcome = entry.get("outcome", "completed")
     job_dir = Path(entry["job_dir"]) if entry.get("job_dir") else None
 
+    def cleanup_settled() -> None:
+        keep_dir = job_dir if entry.get("keep", False) else None
+        checkpoints.cleanup_assignment(
+            HOME, assignment_id, keep_job_dir=keep_dir,
+        )
+
+    def discard_unusable_checkpoint() -> None:
+        item = checkpoints.find_latest(HOME, assignment_id)
+        if item is None:
+            return
+        _discard_checkpoint_quietly(
+            client, item,
+            {"resume_generation": entry.get(
+                "resume_generation", item.resume_generation),
+             "checkpoint_id": item.checkpoint_id},
+            reason="invalid",
+        )
+
     patch, trajectory, result = trial_artifact_paths(Path(entry["trial_dir"]))
     if not patch.is_file():
         print(f"  {task_id}: local artifacts are gone, giving up on this one")
         pending.remove(HOME, assignment_id)
+        discard_unusable_checkpoint()
         return "artifacts-gone"
 
     leaked = scan_secrets(patch.read_bytes())
@@ -289,6 +309,7 @@ def _upload_trial(client: ApiClient, entry: dict) -> str:
         # Not retryable as-is (the patch itself needs manual attention) —
         # don't leave a ledger entry that would just fail the same way forever.
         pending.remove(HOME, assignment_id)
+        discard_unusable_checkpoint()
         return "not-uploaded"
 
     with tempfile.TemporaryDirectory() as td:
@@ -307,18 +328,21 @@ def _upload_trial(client: ApiClient, entry: dict) -> str:
         pending.record(HOME, entry)
         try:
             ack = client.submit(assignment_id, entry["nonce"], patch, traj_scrubbed,
-                                result_scrubbed, entry["meta"], outcome=outcome)
+                                result_scrubbed, entry["meta"], outcome=outcome,
+                                resume_generation=entry.get("resume_generation"))
         except ApiError as exc:
-            if exc.status_code == 409:
+            if exc.status_code == 409 and "already submitted" in str(exc).lower():
                 # Some earlier attempt actually landed server-side even
                 # though THIS process never saw the response — good news.
                 print(f"  {task_id}: already submitted (an earlier attempt landed) — clearing it")
                 pending.remove(HOME, assignment_id)
+                cleanup_settled()
                 return "submitted"
             if exc.status_code == 410:
                 print(f"  {task_id}: lease expired, unsalvageable — the cell reopened "
                       "for someone else, dropping it")
                 pending.remove(HOME, assignment_id)
+                cleanup_settled()
                 return "expired"
             if exc.status_code in (404, 413, 422):
                 # Definitively rejected: the exact same bytes can never
@@ -329,15 +353,17 @@ def _upload_trial(client: ApiClient, entry: dict) -> str:
                 # that may be lifted, and dropping a suspended volunteer's
                 # completed trial would destroy recoverable work.
                 print(f"  {task_id}: the server rejected this upload for good ({exc}) — "
-                      f"retrying can't fix it, dropping it from the retry queue "
-                      f"(the local files stay in {patch.parent.parent})")
+                      "retrying can't fix it, dropping it from the retry queue "
+                      f"(local artifact path: {patch.parent.parent})")
                 pending.remove(HOME, assignment_id)
+                discard_unusable_checkpoint()
                 return "rejected"
             print(f"  {task_id}: upload failed ({exc}) — kept for retry "
                   "(`dradar retry-upload`)")
             return "upload-failed"
 
     pending.remove(HOME, assignment_id)
+    cleanup_settled()
     if ack.get("grade_status") == "invalid":
         # Neutral by design: the cause (printed by _run_and_submit's
         # diagnosis) may be anything from a stale agent image to a real rate
@@ -347,14 +373,16 @@ def _upload_trial(client: ApiClient, entry: dict) -> str:
               "no points lost, the cell reopens for a fresh attempt")
     else:
         print(f"submitted: {ack['submission_id']} (grading happens server-side)")
-    if job_dir:
+    if job_dir and entry.get("keep", False):
+        print(f"  local artifacts kept by --keep: {job_dir}")
+    elif job_dir:
         if outcome == "interrupted":
             # Always keep a failure's artifacts (result.json, agent logs):
             # deleting them made the first volunteer bug report undiagnosable
             # client-side. Completed runs stay tidy-by-default as before.
             if Path(job_dir).is_dir():
                 print(f"  failure artifacts kept for diagnosis: {job_dir}")
-        elif not entry.get("keep", False):
+        else:
             shutil.rmtree(job_dir, ignore_errors=True)
     return "interrupted" if outcome == "interrupted" else "submitted"
 
@@ -366,9 +394,79 @@ def _mark_stopped_quietly(client: ApiClient, assignment: dict) -> None:
         pass
 
 
+def _discard_checkpoint_quietly(
+    client: ApiClient,
+    item: checkpoints.Checkpoint,
+    assignment: dict | None = None,
+    *,
+    reason: str,
+) -> bool:
+    """Invalidate server state first, then remove all local copies."""
+    assignment_id = item.assignment_id
+    if not assignment_id:
+        return False
+    checkpoint_id = (
+        (assignment or {}).get("checkpoint_id") or item.checkpoint_id
+        or f"invalid-{assignment_id[:16]}"
+    )
+    generation = int(
+        (assignment or {}).get("resume_generation", item.resume_generation)
+    )
+    try:
+        client.checkpoint_discard(
+            assignment_id, checkpoint_id, generation, reason=reason,
+        )
+    except ApiError as exc:
+        # Already expired/submitted/not found means there is no live cell left
+        # for this local copy to protect. A transport failure is ambiguous, so
+        # keep the checkpoint and try again on the next startup.
+        if exc.status_code == 404:
+            try:
+                if assignment_id in _active_by_id(client):
+                    print("  server does not support checkpoint discard yet; kept locally")
+                    return False
+            except ApiError:
+                return False
+        if exc.status_code not in (404, 409, 410):
+            print(f"  couldn't discard checkpoint {item.checkpoint_id or '?'}: {exc}; kept locally")
+            return False
+    checkpoints.cleanup_assignment(HOME, assignment_id)
+    return True
+
+
+def _pause_checkpoint_quietly(
+    client: ApiClient, assignment: dict,
+) -> checkpoints.Checkpoint | None:
+    item = checkpoints.find_latest(HOME, assignment["assignment_id"])
+    if item is None:
+        return None
+    if not item.valid or not item.checkpoint_id:
+        _discard_checkpoint_quietly(
+            client, item, assignment, reason="invalid",
+        )
+        return None
+    if item.phase == "incompatible":
+        _discard_checkpoint_quietly(
+            client, item, assignment, reason="incompatible",
+        )
+        return None
+    try:
+        client.checkpoint_pause(
+            assignment["assignment_id"], item.checkpoint_id,
+            item.resume_generation,
+        )
+    except ApiError as exc:
+        # The local checkpoint is still the source of truth while the network
+        # is down. A future `dradar resume` can renew it directly.
+        print(f"  checkpoint saved locally; server pause will retry later ({exc})")
+    checkpoints.prune_superseded(HOME, assignment["assignment_id"], item)
+    return item
+
+
 def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     args, local_commit: str | None,
-                    telemetry: RunnerTelemetry | None = None) -> str:
+                    telemetry: RunnerTelemetry | None = None,
+                    resume_checkpoint: checkpoints.Checkpoint | None = None) -> str:
     """Run one assignment and upload the artifacts. Returns an outcome tag —
     never exits, so the held-batch loop can carry on with the next item."""
     hash_match = check_task_content_hash(assignment, tasks_root)
@@ -382,6 +480,9 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     client.mark_started(
                         assignment["assignment_id"], session_id=telemetry.session_id)
                     if telemetry else client.mark_started(assignment["assignment_id"])
+                ),
+                resume_checkpoint=(
+                    resume_checkpoint.checkpoint_dir if resume_checkpoint else None
                 ))
             break
         except BuildFlakeError as exc:
@@ -398,22 +499,36 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                   "the build failed twice — check your network/proxy and re-run "
                   "`dradar resume` (still free: the agent never started), or "
                   "use `dradar release` if you do not want to keep the cell")
-            _mark_stopped_quietly(client, assignment)
+            if _pause_checkpoint_quietly(client, assignment) is None:
+                _mark_stopped_quietly(client, assignment)
             return "failed"
         except RunnerError as exc:
+            item = _pause_checkpoint_quietly(client, assignment)
+            if item is not None:
+                print(f"trial interrupted: {exc}\n"
+                      f"checkpoint {item.checkpoint_id} was kept; `dradar resume` "
+                      "continues the same workspace/session")
+                return "paused"
             print(f"trial failed: {exc}\n"
                   "use `dradar resume` to retry later, or `dradar release` to "
                   "give the cell back")
-            # Nothing was uploaded, so tell the server to stop showing this
-            # cell as 解题中 (best-effort; the server also self-heals stale
-            # started marks after est x3 with no submission).
             _mark_stopped_quietly(client, assignment)
             return "failed"
+        except (KeyboardInterrupt, EOFError):
+            _pause_checkpoint_quietly(client, assignment)
+            raise
 
     stats = summarize_result(art.result)
     # An interrupted/failed run (nonzero pier rc or recorded exception) is not a
     # model failure: report it so the server marks it invalid, not graded 0.
     interrupted = art.returncode != 0 or stats.get("exception_info")
+    item = checkpoints.find_latest(HOME, assignment["assignment_id"])
+    if interrupted and item is not None and item.phase != "agent_completed":
+        saved = _pause_checkpoint_quietly(client, assignment)
+        if saved is not None:
+            print(f"trial interrupted; checkpoint {saved.checkpoint_id} was kept — "
+                  "the next `dradar resume` continues instead of submitting a partial run")
+            return "paused"
     outcome = "interrupted" if interrupted else "completed"
     if telemetry:
         telemetry.set_phase("uploading", assignment["assignment_id"])
@@ -445,11 +560,15 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         **stats,
     }
 
+    if item is not None and item.job_dir == art.job_dir:
+        checkpoints.prune_superseded(HOME, assignment["assignment_id"], item)
+
     return _upload_trial(client, {
         "assignment_id": assignment["assignment_id"], "nonce": assignment["nonce"],
         "task_id": assignment["task_id"], "trial_dir": str(art.trial_dir),
         "meta": meta, "outcome": outcome,
         "job_dir": str(art.job_dir) if art.job_dir else None, "keep": args.keep,
+        "resume_generation": assignment.get("resume_generation", 0),
     })
 
 
@@ -486,6 +605,244 @@ def cmd_retry_upload(args) -> int:
         return 1
     print("all clear")
     return 0
+
+
+def _active_by_id(client: ApiClient) -> dict[str, dict]:
+    data = client.get_assignment()
+    active = data.get("active")
+    if active is None:
+        one = data.get("assignment")
+        active = [one] if one else []
+    return {a["assignment_id"]: a for a in active if a}
+
+
+def _checkpoint_upload_entry(
+    item: checkpoints.Checkpoint, assignment: dict, args, local_commit: str | None,
+) -> dict:
+    _patch, _trajectory, result = trial_artifact_paths(item.trial_dir)
+    stats = summarize_result(result)
+    return {
+        "assignment_id": assignment["assignment_id"],
+        "nonce": assignment["nonce"],
+        "task_id": assignment["task_id"],
+        "trial_dir": str(item.trial_dir),
+        "meta": {
+            "dradar_version": __version__,
+            "duration_sec": None,
+            "pier_returncode": 0,
+            "dev_agent": args.dev_agent,
+            "task_content_hash_match": None,
+            "deep_swe_commit": local_commit,
+            "recovered_completed_checkpoint": True,
+            **stats,
+        },
+        "outcome": "completed",
+        "job_dir": str(item.job_dir),
+        "keep": args.keep,
+        "resume_generation": assignment.get(
+            "resume_generation", item.resume_generation),
+    }
+
+
+def _resume_one_checkpoint(
+    client: ApiClient,
+    item: checkpoints.Checkpoint,
+    assignment: dict | None,
+    args,
+    tasks_root: Path,
+    telemetry: RunnerTelemetry | None,
+) -> str:
+    assignment_id = item.assignment_id
+    if assignment_id is None:
+        checkpoints.remove(HOME, item)
+        return "discarded"
+    try:
+        with checkpoints.assignment_lock(HOME, assignment_id):
+            if assignment is None:
+                # Pending uploads were flushed before discovery. No active
+                # lease now therefore means submitted/expired/released.
+                checkpoints.cleanup_assignment(HOME, assignment_id)
+                print(f"  {assignment_id}: no active server lease; removed stale local checkpoint")
+                return "discarded"
+            if not item.valid or checkpoints.is_expired(item):
+                reason = "expired" if checkpoints.is_expired(item) else "invalid"
+                print(f"  {assignment_id}: checkpoint is {reason}; reopening the cell")
+                if _discard_checkpoint_quietly(
+                    client, item, assignment, reason=reason,
+                ):
+                    return "discarded"
+                return "paused"
+            if item.phase == "incompatible":
+                print(f"  {assignment_id}: checkpoint is incompatible; reopening the cell")
+                if _discard_checkpoint_quietly(
+                    client, item, assignment, reason="incompatible",
+                ):
+                    return "discarded"
+                return "paused"
+            if item.task_id and item.task_id != assignment.get("task_id"):
+                print(f"  {assignment_id}: checkpoint task does not match the lease; discarding it")
+                if _discard_checkpoint_quietly(
+                    client, item, assignment, reason="incompatible",
+                ):
+                    return "discarded"
+                return "paused"
+
+            local_commit = _check_version_pin(
+                assignment.get("deep_swe_commit"), tasks_root,
+                args.allow_task_drift,
+            )
+            if item.phase == "agent_completed":
+                patch, _traj, _result = trial_artifact_paths(item.trial_dir)
+                if not patch.is_file():
+                    print(f"  {assignment_id}: completed checkpoint has no patch; discarding it")
+                    _discard_checkpoint_quietly(
+                        client, item, assignment, reason="invalid",
+                    )
+                    return "discarded"
+                print(f"found completed checkpoint {item.checkpoint_id}; uploading without rerunning")
+                checkpoints.prune_superseded(HOME, assignment_id, item)
+                return _upload_trial(
+                    client,
+                    _checkpoint_upload_entry(
+                        item, assignment, args, local_commit,
+                    ),
+                )
+
+            if telemetry:
+                telemetry.bind_batch(assignment.get("batch_id"))
+                telemetry.set_phase("running", assignment_id)
+                telemetry.flush()
+            try:
+                data = client.checkpoint_resume(
+                    assignment_id, item.checkpoint_id,
+                    item.resume_generation,
+                    session_id=telemetry.session_id if telemetry else None,
+                )
+            except ApiError as exc:
+                if exc.status_code == 404:
+                    try:
+                        still_active = assignment_id in _active_by_id(client)
+                    except ApiError:
+                        still_active = True
+                    if still_active:
+                        print("  server does not support checkpoint resume yet; kept locally")
+                        return "paused"
+                if exc.status_code in (404, 410):
+                    checkpoints.cleanup_assignment(HOME, assignment_id)
+                    print(f"  {assignment_id}: checkpoint lease is gone ({exc}); removed locally")
+                    return "discarded"
+                print(f"  {assignment_id}: couldn't resume checkpoint ({exc}); kept locally")
+                return "paused"
+            resumed = data["assignment"]
+            print(f"resuming checkpoint {item.checkpoint_id} for {resumed['task_id']} "
+                  f"(generation {resumed.get('resume_generation', '?')})")
+            outcome = _run_and_submit(
+                client, resumed, tasks_root, args, local_commit,
+                telemetry=telemetry, resume_checkpoint=item,
+            )
+            if telemetry:
+                telemetry.set_phase("queued")
+            return outcome
+    except checkpoints.CheckpointBusy:
+        return "busy"
+
+
+def _resume_local_checkpoints(
+    client: ApiClient,
+    args,
+    tasks_root: Path,
+    telemetry: RunnerTelemetry | None,
+) -> tuple[list[str], bool]:
+    """Recover local work before the server is allowed to dispense new work."""
+    target = getattr(args, "assignment", None)
+    candidates = list(checkpoints.latest_by_assignment(HOME).values())
+    if target:
+        candidates = [c for c in candidates if c.assignment_id == target]
+    if not candidates:
+        if target:
+            print(f"no local checkpoint for assignment {target}")
+        return [], False
+
+    try:
+        active = _active_by_id(client)
+    except ApiError as exc:
+        _exit_for(exc)
+    print(f"found {len(candidates)} unfinished checkpoint(s); recovering before new work...")
+    results = []
+    for item in candidates:
+        outcome = _resume_one_checkpoint(
+            client, item, active.get(item.assignment_id), args, tasks_root, telemetry,
+        )
+        if outcome == "busy":
+            continue
+        results.append(outcome)
+        # Super-account batch workers use --parallel. Each process owns one
+        # checkpoint for its whole lifetime, so one corrupt worker cannot
+        # serialize or block the other 23.
+        if getattr(args, "parallel", False):
+            break
+    return results, True
+
+
+def _format_size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{size}B"
+
+
+def cmd_checkpoints(args) -> int:
+    items = checkpoints.scan(HOME)
+    if not items:
+        print("no local checkpoints")
+        return 0
+    total = 0
+    for item in items:
+        size = item.size_bytes
+        total += size
+        state = item.phase if item.valid else f"invalid ({item.invalid_reason})"
+        print(f"{item.checkpoint_id or '?'}  assignment={item.assignment_id or '?'}  "
+              f"task={item.task_id or '?'}  state={state}  size={_format_size(size)}  "
+              f"updated={item.updated_at.isoformat()}")
+    print(f"total: {len(items)} checkpoint(s), {_format_size(total)}")
+    return 0
+
+
+def cmd_checkpoint_discard(args) -> int:
+    items = checkpoints.scan(HOME)
+    matches = [item for item in items if (
+        item.checkpoint_id == args.checkpoint_id
+        or item.assignment_id == args.checkpoint_id
+    )]
+    if not matches:
+        print(f"checkpoint not found: {args.checkpoint_id}")
+        return 1
+    cfg = _load_config()
+    client = _client(cfg)
+    try:
+        active = _active_by_id(client)
+    except ApiError as exc:
+        _exit_for(exc)
+    ok = True
+    seen = set()
+    for item in matches:
+        if item.assignment_id in seen:
+            continue
+        seen.add(item.assignment_id)
+        assignment = active.get(item.assignment_id)
+        if assignment is None:
+            if item.assignment_id:
+                checkpoints.cleanup_assignment(HOME, item.assignment_id)
+            else:
+                checkpoints.remove(HOME, item)
+            continue
+        ok &= _discard_checkpoint_quietly(
+            client, item, assignment, reason="user_discard",
+        )
+    print("checkpoint discarded; its cell is open again" if ok else "checkpoint kept")
+    return 0 if ok else 1
 
 
 def cmd_go(args) -> int:
@@ -527,6 +884,25 @@ def cmd_go(args) -> int:
         # Self-heal before anything else: a trial from a previous run that ran
         # but failed to upload must not just sit on disk forever.
         _retry_pending_uploads(client)
+
+        recovered, found_checkpoints = _resume_local_checkpoints(
+            client, args, tasks_root, telemetry,
+        )
+        recovery_ok = all(
+            outcome in ("submitted", "interrupted", "discarded", "expired")
+            for outcome in recovered
+        )
+        if getattr(args, "assignment", None):
+            close_reason = "completed" if recovery_ok and recovered else "paused"
+            return 0 if recovery_ok and recovered else 1
+        if recovered and not recovery_ok:
+            close_reason = "paused"
+            return 1
+        if found_checkpoints and getattr(args, "resume", False) and not recovered:
+            # Every matching checkpoint is already owned by another local
+            # worker. Do not fall through and compete for newly dispensed work.
+            close_reason = "paused"
+            return 1
 
         rc = _go_menu(args, cfg, client, tasks_root, telemetry=telemetry)
         close_reason = "completed" if rc == 0 else "paused"

@@ -45,6 +45,30 @@ runner 已停止但状态仍卡住时才使用 `dradar release <assignment-id> -
 
 其他命令：`dradar status`（看自己的提交记录/积分/异常标记和占用摘要）、`dradar rename <新名字>`（改榜单显示名，积分不受影响）、`dradar link-github`（把账号和 GitHub 身份绑定，换机器能找回身份）、`dradar retry-upload`（补传因网络问题失败的提交）。
 
+## 中断续跑与本地清理
+
+Codex 任务运行期间，Pier 每 30 秒把工作区差异、未跟踪文件、Codex session id、
+运行阶段和心跳写入 `~/.dradar/work/jobs/` 下的私有 checkpoint。WebSocket/TLS
+断开、模型容量不足、CLI 退出或机器重启后，下一次 `dradar go` / `resume` 会先恢复
+checkpoint，再领取新格子。原 Codex session 不可用时会保留工作区，用已有进度摘要
+启动新 session 继续。
+
+```bash
+dradar resume                         # 优先恢复所有未完成 checkpoint
+dradar resume --assignment <id>       # 只恢复指定 assignment
+dradar checkpoints                    # 查看状态、更新时间和磁盘占用
+dradar checkpoint discard <id>        # 放弃 checkpoint 并重新开放格子
+```
+
+checkpoint 不保存账号 Token、assignment nonce 或 Codex `auth.json`；恢复时重新向
+服务端鉴权。凭据形态的工作区内容会使 checkpoint 安全失效，session 中检测到凭据
+则不持久化该 session，并降级为保留工作区的新会话恢复。
+
+磁盘默认不会无限增长：提交成功或服务端确认已提交后立即删除该题的所有本地副本；
+恢复产生新副本后删除旧副本；损坏、不兼容、超过 7 天或租约已失效的 checkpoint
+会被标记无效、重新开放格子并回收。上传暂时失败时只保留可重试的最新任务目录；
+只有显式传入 `--keep` 才保留成功任务的最终目录。
+
 ## 租约心跳与隐私
 
 `dradar go` / `resume` 会为本次 CLI 进程建立一个轻量会话心跳：运行或上传时约
