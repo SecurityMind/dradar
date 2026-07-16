@@ -30,6 +30,25 @@ def test_codex_disables_web_search(tmp_path, monkeypatch):
     assert allowlist.index("web_search") < allowlist.index("[__pier_allowlist]")
 
 
+def test_codex_prompt_requires_submission_artifact(tmp_path, monkeypatch):
+    _stub_pier(monkeypatch)
+    task = tmp_path / "abs-module-cache-flags"
+    task.mkdir()
+    monkeypatch.setenv("CODEX_AUTH_JSON_PATH", str(tmp_path / "auth.json"))
+    (tmp_path / "auth.json").write_text("{}")
+    home = tmp_path / "home"
+    home.mkdir()
+
+    cmd = build_pier_command(_assignment("codex"), tmp_path, tmp_path / "jobs", "j", home)
+
+    prompt = home / "codex-submission-prompt.j2"
+    assert f"prompt_template_path={prompt}" in cmd
+    text = prompt.read_text()
+    assert "{{ instruction }}" in text
+    assert "bash /tests/pre_artifacts.sh" in text
+    assert "test -s /logs/artifacts/model.patch" in text
+
+
 def test_claude_code_disallows_web_tools(tmp_path, monkeypatch):
     _stub_pier(monkeypatch)
     task = tmp_path / "abs-module-cache-flags"

@@ -36,6 +36,16 @@ ALLOWLIST_TOML = (
 # Claude Code: deny the web tools (and keep pier's default EnterPlanMode deny).
 CLAUDE_DISALLOWED_TOOLS = "WebSearch WebFetch EnterPlanMode"
 
+CODEX_SUBMISSION_PROMPT = """{{ instruction }}
+
+Before finishing, after the implementation is complete and committed, create
+the submission artifact required by this benchmark. Run these commands inside
+the task container and do not finish until the final check succeeds:
+
+    bash /tests/pre_artifacts.sh
+    test -s /logs/artifacts/model.patch
+"""
+
 
 @dataclass
 class TrialArtifacts:
@@ -116,6 +126,12 @@ def claude_oauth_token() -> str | None:
 def _ensure_allowlist(home: Path) -> Path:
     path = home / "codex-chatgpt-allowlist.toml"
     path.write_text(ALLOWLIST_TOML)
+    return path
+
+
+def _ensure_codex_submission_prompt(home: Path) -> Path:
+    path = home / "codex-submission-prompt.j2"
+    path.write_text(CODEX_SUBMISSION_PROMPT)
     return path
 
 
@@ -201,10 +217,12 @@ def build_pier_command(
         if not auth.is_file():
             raise RunnerError(f"codex auth not found: {auth} (run `codex login` first)")
         allowlist = _ensure_allowlist(home)
+        submission_prompt = _ensure_codex_submission_prompt(home)
         cmd += [
             "--model", assignment["model"],
             "--ak", f"reasoning_effort={assignment['effort']}",
             "--ak", f"config_toml_file={allowlist}",
+            "--ak", f"prompt_template_path={submission_prompt}",
             "--ak", "checkpoint_enabled=true",
             "--ak", f"checkpoint_assignment_id={assignment['assignment_id']}",
             "--ak", f"checkpoint_task_id={assignment['task_id']}",
