@@ -432,9 +432,9 @@ def _last_activity(log_path: Path) -> str:
 
 def _trial_timeout_sec(assignment: dict) -> int:
     """Cap for one trial: a generous multiple of the server's estimate, with
-    a floor for image pull/build."""
+    a one-hour floor for image pull/build and long model turns."""
     est_min = assignment.get("est_minutes") or 30
-    return max(1800, int(est_min) * 60 * 4)
+    return max(3600, int(est_min) * 60 * 4)
 
 
 def run_trial(

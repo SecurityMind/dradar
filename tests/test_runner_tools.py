@@ -427,10 +427,12 @@ def test_trial_timeout_defaults_and_floor():
     # missing/None estimate falls back to 30 min -> 30*60*4
     assert _trial_timeout_sec({}) == 7200
     assert _trial_timeout_sec({"est_minutes": None}) == 7200
-    assert _trial_timeout_sec({"est_minutes": 5}) == 1800   # floor wins
+    assert _trial_timeout_sec({"est_minutes": 5}) == 3600   # floor wins
+    assert _trial_timeout_sec({"est_minutes": 10}) == 3600  # floor wins
 
 
 def test_trial_timeout_scales_with_estimate():
+    assert _trial_timeout_sec({"est_minutes": 20}) == 4800
     assert _trial_timeout_sec({"est_minutes": 30}) == 7200
     assert _trial_timeout_sec({"est_minutes": 120}) == 28800
 
