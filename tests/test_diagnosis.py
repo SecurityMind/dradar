@@ -133,7 +133,7 @@ def test_interrupted_model_capacity_advice_is_not_a_quota_guess(
     client = InvalidAckClient({})
     runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc123")
     out = capsys.readouterr().out
-    assert "known upstream issue" in out
+    assert "retried the original Codex session" in out
     assert "wait for your quota" not in out.lower()   # not the rate-limit advice
 
 

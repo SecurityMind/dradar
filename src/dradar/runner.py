@@ -275,23 +275,53 @@ def local_deep_swe_commit(tasks_root: Path) -> str | None:
 # The (public) task repo. Self-bootstrap clones it so a volunteer never has to.
 DEEP_SWE_REPO = "https://github.com/datacurve-ai/deep-swe"
 
+# Temporary SecurityMind Pier build containing the model-capacity session-resume
+# fix from datacurve-ai/pier#23. Keep the immutable commit pin until the fix is
+# released upstream, then replace this with the official minimum version.
+PIER_VERSION = "0.3.0.post1"
+PIER_COMMIT = "7c121ef84bc5119729acebff36a49188dc9036c1"
+PIER_SPEC = (
+    "datacurve-pier @ git+https://github.com/SecurityMind/pier.git@"
+    f"{PIER_COMMIT}"
+)
+PIER_INSTALL_COMMAND = f"uv tool install --force '{PIER_SPEC}'"
+
+
+def _pier_version(pier: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            [pier, "--version"], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
 
 def ensure_pier() -> None:
-    """Auto-install pier if it's not on PATH -- one less manual prereq. Raises
-    RunnerError (not a silent skip) if it can't, so the volunteer sees why."""
-    if shutil.which("pier"):
+    """Ensure the pinned Pier build with capacity-resume support is active."""
+    pier = shutil.which("pier")
+    installed_version = _pier_version(pier) if pier else None
+    if installed_version == PIER_VERSION:
         return
     uv = shutil.which("uv")
     if not uv:
         raise RunnerError(
-            "pier and uv are both missing -- install uv first: "
+            f"Pier {PIER_VERSION} is required but uv is missing -- install uv first: "
             "curl -LsSf https://astral.sh/uv/install.sh | sh")
-    print("pier not found — installing it (one-time: uv tool install datacurve-pier)...")
-    proc = subprocess.run([uv, "tool", "install", "datacurve-pier"])
-    if proc.returncode != 0 or not shutil.which("pier"):
+    if pier:
+        print(f"Pier {installed_version or 'unknown'} lacks capacity resume — "
+              f"installing SecurityMind build {PIER_VERSION}...")
+    else:
+        print(f"pier not found — installing SecurityMind build {PIER_VERSION}...")
+    proc = subprocess.run([uv, "tool", "install", "--force", PIER_SPEC])
+    active_pier = shutil.which("pier")
+    active_version = _pier_version(active_pier) if active_pier else None
+    if proc.returncode != 0 or active_version != PIER_VERSION:
         raise RunnerError(
-            "couldn't install pier automatically; run `uv tool install datacurve-pier` "
-            "yourself and make sure ~/.local/bin is on your PATH")
+            f"couldn't activate Pier {PIER_VERSION}; run `{PIER_INSTALL_COMMAND}` "
+            "yourself and make sure ~/.local/bin precedes other Pier installs on PATH")
 
 
 def ensure_tasks_root(tasks_root: Path) -> None:
@@ -549,10 +579,10 @@ def diagnose_exception(result_path: Path | None) -> dict:
         # codex treats a momentary "Selected model is at capacity" as a fatal
         # turn.failed, which pier reports as a plain nonzero exit -- this is
         # not a real failure of the agent's work (volunteer report #3,
-        # 2026-07-15: caught mid-run after 1,327 passing tests). A real fix
-        # (preserve the container, resume the root session) needs an
-        # upstream pier change; until that ships, classify it honestly
-        # instead of leaving it "unrecognized".
+        # 2026-07-15: caught mid-run after 1,327 passing tests). The pinned
+        # SecurityMind Pier build resumes the root session with bounded
+        # retries; reaching this diagnostic means those retries were
+        # exhausted. Keep the distinct classification for honest reporting.
         kind = "model-capacity"
     tail = [ln.strip() for ln in msg.splitlines() if ln.strip()][-6:]
     return {"type": info.get("exception_type"), "kind": kind, "tail": tail}
@@ -576,9 +606,8 @@ DIAG_ADVICE = {
         "the agent could not authenticate inside the container — run "
         "`codex login` again and re-check `dradar doctor`."),
     "model-capacity": (
-        "the model was momentarily at capacity and codex treated it as a "
-        "fatal error, even if your run was otherwise going fine — this is a "
-        "known upstream issue, not something wrong with your setup or your "
-        "work. A real fix (resuming instead of restarting) is in flight "
-        "upstream; for now just claim a fresh cell and re-run."),
+        "the model stayed at capacity after Pier retried the original Codex "
+        "session with bounded backoff. This is not a problem with your setup "
+        "or work; the automatic recovery was attempted but could not finish "
+        "within its retry budget. Claim the cell again later."),
 }

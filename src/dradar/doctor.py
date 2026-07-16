@@ -106,7 +106,9 @@ def cmd_doctor(args) -> int:
         runner.ensure_pier()
     except runner.RunnerError:
         pass
-    all_ok &= _check("pier", bool(shutil.which("pier")), "uv tool install datacurve-pier")
+    pier = shutil.which("pier")
+    pier_ready = bool(pier and runner._pier_version(pier) == runner.PIER_VERSION)
+    all_ok &= _check("pier", pier_ready, runner.PIER_INSTALL_COMMAND)
 
     # Agent: you only need ONE family working. If the one you're set up for is
     # ready, say so and stay quiet about the other -- don't print a FAIL for

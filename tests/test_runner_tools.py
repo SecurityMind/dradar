@@ -127,12 +127,13 @@ import pytest
 from dradar.runner import RunnerError, ensure_pier, ensure_tasks_root
 
 
-def test_ensure_pier_noop_when_present(monkeypatch):
+def test_ensure_pier_noop_when_required_version_present(monkeypatch):
     monkeypatch.setattr(runner_mod.shutil, "which", lambda n: "/usr/bin/pier")
+    monkeypatch.setattr(runner_mod, "_pier_version", lambda _: runner_mod.PIER_VERSION)
     called = []
     monkeypatch.setattr(runner_mod.subprocess, "run", lambda *a, **k: called.append(a))
     ensure_pier()
-    assert called == []            # already there -> never shells out
+    assert called == []            # approved build -> never installs
 
 
 def test_ensure_pier_installs_via_uv_when_missing(monkeypatch):
@@ -142,12 +143,35 @@ def test_ensure_pier_installs_via_uv_when_missing(monkeypatch):
             return "/usr/bin/uv"
         return seen["pier"]
     monkeypatch.setattr(runner_mod.shutil, "which", which)
+    monkeypatch.setattr(
+        runner_mod, "_pier_version",
+        lambda path: runner_mod.PIER_VERSION if path else None,
+    )
     def fake_run(cmd, *a, **k):
-        assert cmd == ["/usr/bin/uv", "tool", "install", "datacurve-pier"]
+        assert cmd == [
+            "/usr/bin/uv", "tool", "install", "--force", runner_mod.PIER_SPEC,
+        ]
         seen["pier"] = "/root/.local/bin/pier"   # simulate the install landing
         return subprocess.CompletedProcess(cmd, 0)
     monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
     ensure_pier()                  # should not raise
+
+
+def test_ensure_pier_replaces_old_version(monkeypatch):
+    versions = iter(["0.3.0", runner_mod.PIER_VERSION])
+    monkeypatch.setattr(runner_mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+    monkeypatch.setattr(runner_mod, "_pier_version", lambda _: next(versions))
+    called = []
+    monkeypatch.setattr(
+        runner_mod.subprocess, "run",
+        lambda cmd, *a, **k: called.append(cmd) or subprocess.CompletedProcess(cmd, 0),
+    )
+
+    ensure_pier()
+
+    assert called == [[
+        "/usr/bin/uv", "tool", "install", "--force", runner_mod.PIER_SPEC,
+    ]]
 
 
 def test_ensure_pier_errors_when_no_uv(monkeypatch):
