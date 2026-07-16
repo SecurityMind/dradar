@@ -127,7 +127,9 @@ class ApiClient:
         candidates only, not yet claimed."""
         return self._get(f"/api/v1/suggest?n={n}")
 
-    def mark_started(self, assignment_id: str) -> dict[str, Any]:
+    def mark_started(
+        self, assignment_id: str, session_id: str | None = None,
+    ) -> dict[str, Any]:
         """Confirms the trial subprocess actually started (see runner.run_trial):
         extends a free-pick claim's short initial lease out to the normal
         window. Best-effort by design — callers should swallow ApiError
@@ -136,10 +138,14 @@ class ApiClient:
         that never had a short window to extend in the first place."""
         return self._post(
             "/api/v1/assignment/started",
-            data={"assignment_id": assignment_id},
+            data={"assignment_id": assignment_id, "session_id": session_id or ""},
         )
 
-    def checkout(self, exclude_assignment_ids: set[str] | list[str] | None = None) -> dict[str, Any]:
+    def checkout(
+        self,
+        exclude_assignment_ids: set[str] | list[str] | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
         """Atomically check out this volunteer's next not-yet-started cell —
         the primitive that makes parallel sessions safe: N concurrent callers
         get N different cells. Returns {assignment: dict|None, held, unstarted};
@@ -151,7 +157,8 @@ class ApiClient:
         excluded = sorted(set(exclude_assignment_ids or ()))
         return self._post(
             "/api/v1/assignment/checkout",
-            data={"exclude_assignment_ids": ",".join(excluded)},
+            data={"exclude_assignment_ids": ",".join(excluded),
+                  "session_id": session_id or ""},
         )
 
     def release_assignments(

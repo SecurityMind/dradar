@@ -54,8 +54,22 @@ def test_checkout_sends_failed_cell_exclusions():
         seen["body"] = request.read()
         return httpx.Response(200, json={"assignment": None, "held": 1, "unstarted": 0})
 
-    _client(handler).checkout(exclude_assignment_ids={"a2", "a1"})
+    _client(handler).checkout(
+        exclude_assignment_ids={"a2", "a1"}, session_id="session-123")
     assert b"exclude_assignment_ids=a1%2Ca2" in seen["body"]
+    assert b"session_id=session-123" in seen["body"]
+
+
+def test_mark_started_sends_runner_session_id():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = request.read()
+        return httpx.Response(200, json={"ok": True})
+
+    _client(handler).mark_started("a1", session_id="session-123")
+    assert b"assignment_id=a1" in seen["body"]
+    assert b"session_id=session-123" in seen["body"]
 
 
 def test_release_sends_bulk_target_and_force_flags():

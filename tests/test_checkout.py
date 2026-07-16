@@ -11,7 +11,7 @@ def _cell(aid):
     return {"assignment_id": aid, "task_id": f"task-{aid}", "agent": "codex",
             "model": "gpt-5.6-sol", "effort": "low", "nonce": "n",
             "expires_at": "2099-01-01T00:00:00+00:00", "est_minutes": 2,
-            "est_quota_pct": 0.5, "deep_swe_commit": None}
+            "est_quota_pct": 0.5, "deep_swe_commit": None, "batch_id": "batch-1"}
 
 
 class CheckoutClient(FakeClient):
@@ -19,10 +19,12 @@ class CheckoutClient(FakeClient):
         super().__init__(assignment_data)
         self._checkouts = list(checkouts)   # dicts returned in order, or exceptions
         self.checkout_exclusions = []
+        self.checkout_sessions = []
         self.stopped = []
 
-    def checkout(self, exclude_assignment_ids=None):
+    def checkout(self, exclude_assignment_ids=None, session_id=None):
         self.checkout_exclusions.append(set(exclude_assignment_ids or ()))
+        self.checkout_sessions.append(session_id)
         result = self._checkouts.pop(0) if self._checkouts else {"assignment": None,
                                                                  "held": 0, "unstarted": 0}
         if isinstance(result, Exception):
@@ -32,6 +34,24 @@ class CheckoutClient(FakeClient):
     def mark_stopped(self, assignment_id):
         self.stopped.append(assignment_id)
         return {"ok": True}
+
+
+class StubTelemetry:
+    session_id = "session-test"
+
+    def __init__(self):
+        self.bound = []
+        self.flushes = 0
+        self.phases = []
+
+    def bind_batch(self, batch_id):
+        self.bound.append(batch_id)
+
+    def flush(self):
+        self.flushes += 1
+
+    def set_phase(self, phase, assignment_id=None):
+        self.phases.append((phase, assignment_id))
 
 
 def test_checkout_loop_runs_dispensed_cells_until_drained(monkeypatch, capsys, tmp_path):
@@ -47,6 +67,22 @@ def test_checkout_loop_runs_dispensed_cells_until_drained(monkeypatch, capsys, t
     assert ran == ["a1", "a2"]
     out = capsys.readouterr().out
     assert "checked out task-a1" in out and "1 more waiting" in out
+
+
+def test_checkout_flushes_and_passes_session_id_before_server_stamps_cell(
+        monkeypatch, tmp_path):
+    _patch_run(monkeypatch)
+    telemetry = StubTelemetry()
+    client = CheckoutClient(
+        {"active": [_cell("a1")], "free_pick": True},
+        [{"assignment": _cell("a1"), "held": 1, "unstarted": 0},
+         {"assignment": None, "held": 1, "unstarted": 0}],
+    )
+    assert runloop._go_menu(
+        _args(), {}, client, tmp_path, telemetry=telemetry) == 0
+    assert client.checkout_sessions == ["session-test", "session-test"]
+    assert telemetry.flushes >= 2
+    assert ("running", "a1") in telemetry.phases
 
 
 def test_checkout_404_falls_back_to_legacy_batch(monkeypatch, tmp_path):

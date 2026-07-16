@@ -378,7 +378,11 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         try:
             art = run_trial(
                 assignment, tasks_root, work_dir, dev_agent=args.dev_agent,
-                on_started=lambda: client.mark_started(assignment["assignment_id"]))
+                on_started=lambda: (
+                    client.mark_started(
+                        assignment["assignment_id"], session_id=telemetry.session_id)
+                    if telemetry else client.mark_started(assignment["assignment_id"])
+                ))
             break
         except BuildFlakeError as exc:
             # The image build died before the agent ran — a free failure
@@ -596,6 +600,10 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
                 return 1
         if telemetry:
             telemetry.set_phase("running", assignment["assignment_id"])
+            # Make the session/assignment relationship visible before the
+            # subprocess can start or fail. assignment/started then stamps
+            # started_at + this same session id in one server transaction.
+            telemetry.flush()
         results.append(_run_and_submit(
             client, assignment, tasks_root, args, local_commit, telemetry=telemetry))
         if telemetry:
@@ -622,11 +630,33 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             # but this session must not immediately take the same cell again.
             # The server applies this exclusion before stamping started_at,
             # allowing the loop to keep draining other waiting cells.
-            data = client.checkout(exclude_assignment_ids=failed_ids)
+            if telemetry:
+                telemetry.flush()  # register queued state before atomic checkout
+                data = client.checkout(
+                    exclude_assignment_ids=failed_ids,
+                    session_id=telemetry.session_id,
+                )
+            else:
+                data = client.checkout(exclude_assignment_ids=failed_ids)
         except ApiError as exc:
-            if exc.status_code == 404:
+            if (telemetry and exc.status_code == 409
+                    and "runner session" in str(exc)):
+                # A first heartbeat and checkout can cross on a very fast
+                # machine. Serialize one fresh heartbeat and retry checkout
+                # exactly once; no assignment was stamped by the rejected
+                # transaction, so this retry cannot duplicate work.
+                telemetry.flush()
+                try:
+                    data = client.checkout(
+                        exclude_assignment_ids=failed_ids,
+                        session_id=telemetry.session_id,
+                    )
+                except ApiError as retry_exc:
+                    _exit_for(retry_exc)
+            elif exc.status_code == 404:
                 return None if not results else 0  # old server / endpoint gone
-            _exit_for(exc)
+            else:
+                _exit_for(exc)
         assignment = data.get("assignment")
         if not assignment:
             if not results:

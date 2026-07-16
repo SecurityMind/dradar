@@ -42,6 +42,7 @@ class RunnerTelemetry:
         self.client = client
         self.session_id = uuid.uuid4().hex
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -104,44 +105,49 @@ class RunnerTelemetry:
 
     def _send_once(self) -> int:
         """Send once and return the server-selected next interval."""
-        if self._disabled:
-            return self._interval
-        try:
-            response = self.client.runner_heartbeat(self._payload())
-        except ApiError as exc:
-            # Older servers have no endpoint. Silence and disable rather than
-            # alarming users or producing a 404 every two minutes forever.
-            if exc.status_code == 404:
-                self._disabled = True
+        with self._send_lock:
+            if self._disabled:
                 return self._interval
-            self._failures += 1
-            if self._failures >= 3 and not self._warned:
-                print("warning: the server cannot see this runner's heartbeat; "
-                      "work continues and your leases are not auto-released",
-                      file=sys.stderr)
-                self._warned = True
-            return self._interval
-        except Exception:
-            self._failures += 1
-            if self._failures >= 3 and not self._warned:
-                print("warning: runner heartbeat is unavailable; work continues and "
-                      "your leases are not auto-released", file=sys.stderr)
-                self._warned = True
+            try:
+                response = self.client.runner_heartbeat(self._payload())
+            except ApiError as exc:
+                # Older servers have no endpoint. Silence and disable rather than
+                # alarming users or producing a 404 every two minutes forever.
+                if exc.status_code == 404:
+                    self._disabled = True
+                    return self._interval
+                self._failures += 1
+                if self._failures >= 3 and not self._warned:
+                    print("warning: the server cannot see this runner's heartbeat; "
+                          "work continues and your leases are not auto-released",
+                          file=sys.stderr)
+                    self._warned = True
+                return self._interval
+            except Exception:
+                self._failures += 1
+                if self._failures >= 3 and not self._warned:
+                    print("warning: runner heartbeat is unavailable; work continues and "
+                          "your leases are not auto-released", file=sys.stderr)
+                    self._warned = True
+                return self._interval
+
+            if self._warned:
+                print("runner heartbeat recovered", file=sys.stderr)
+            self._failures = 0
+            self._warned = False
+            if response.get("batch_id"):
+                with self._lock:
+                    self._batch_id = response["batch_id"]
+            requested = response.get("next_heartbeat_sec", self._interval)
+            try:
+                self._interval = min(600, max(30, int(requested)))
+            except (TypeError, ValueError):
+                pass
             return self._interval
 
-        if self._warned:
-            print("runner heartbeat recovered", file=sys.stderr)
-        self._failures = 0
-        self._warned = False
-        if response.get("batch_id"):
-            with self._lock:
-                self._batch_id = response["batch_id"]
-        requested = response.get("next_heartbeat_sec", self._interval)
-        try:
-            self._interval = min(600, max(30, int(requested)))
-        except (TypeError, ValueError):
-            pass
-        return self._interval
+    def flush(self) -> None:
+        """Synchronously register the latest state before an atomic checkout."""
+        self._send_once()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -168,7 +174,8 @@ class RunnerTelemetry:
                 "seq": self._seq,
                 "reason": reason,
             }
-        try:
-            self.client.runner_close(payload)
-        except Exception:
-            pass
+        with self._send_lock:
+            try:
+                self.client.runner_close(payload)
+            except Exception:
+                pass
