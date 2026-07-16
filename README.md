@@ -21,7 +21,7 @@
 
 ## 快速开始
 
-最简单的方式：去 [radar.codexradar.com](https://radar.codexradar.com) 用 GitHub 登录、在大表里点一个还没人做的格子认领——网站会直接给你一条粘贴命令，装 CLI、认证、开始跑这道题一次搞定。
+最简单的方式：去 [deng.codexradar.com](https://deng.codexradar.com) 用 GitHub 登录、在大表里点一个还没人做的格子认领——网站会直接给你一条粘贴命令，装 CLI、认证、开始跑这道题一次搞定。
 
 也可以手动来：
 
