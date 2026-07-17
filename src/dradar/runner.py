@@ -304,8 +304,8 @@ DEEP_SWE_REPO = "https://github.com/datacurve-ai/deep-swe"
 # Temporary SecurityMind Pier build containing datacurve-ai/pier#23 plus
 # persistent workspace/Codex-session checkpoints. Keep the immutable commit
 # pin until both fixes are released upstream, then follow the official tag.
-PIER_VERSION = "0.3.0.post2"
-PIER_COMMIT = "e204586dc21a36eff12cfb34303d6c54ab1e0a3e"
+PIER_VERSION = "0.3.0.post3"
+PIER_COMMIT = "acd1d94a53c9ada225187e4b73206970f14ba415"
 PIER_SPEC = (
     "datacurve-pier @ git+https://github.com/SecurityMind/pier.git@"
     f"{PIER_COMMIT}"
