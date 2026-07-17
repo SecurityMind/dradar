@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import pending
 from .api_client import ApiClient, ApiError
-from .local_config import HOME, _load_config, _save_config
+from .local_config import HOME, _load_config, _save_config, default_tasks_root
 
 
 def _auto_register(cfg: dict) -> None:
@@ -64,6 +64,11 @@ def cmd_login(args) -> int:
         print(f"registered as {ack['nickname']}")
     if args.tasks_root:
         cfg["tasks_root"] = str(Path(args.tasks_root).expanduser().resolve())
+    elif not cfg.get("tasks_root"):
+        # New installs stay out of ~/deep-swe.  An existing explicit path is
+        # deliberately preserved: upgrading must not clone a duplicate repo
+        # or silently abandon a volunteer's current checkout.
+        cfg["tasks_root"] = str(default_tasks_root())
     if not cfg.get("server"):
         sys.exit("need --server")
     if getattr(args, "github", False) and not cfg.get("token"):

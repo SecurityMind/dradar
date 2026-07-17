@@ -38,7 +38,10 @@ def main(argv: list[str] | None = None) -> int:
     p_login.add_argument("--server")
     p_login.add_argument("--token")
     p_login.add_argument("--nickname", help="register a new account instead of using a token")
-    p_login.add_argument("--tasks-root", help="path to deep-swe/tasks checkout")
+    p_login.add_argument(
+        "--tasks-root",
+        help="path to deep-swe/tasks checkout (default: ~/.dradar/deep-swe/tasks)",
+    )
     p_login.add_argument("--github", action="store_true",
                          help="recover your identity via GitHub (device flow)")
     p_login.set_defaults(func=cmd_login)
