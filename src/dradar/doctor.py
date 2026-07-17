@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import __version__, runner
 from .identity import _client
-from .local_config import _load_config
+from .local_config import _load_config, tasks_root_from_config
 
 
 def _check(label: str, ok: bool, hint: str = "") -> bool:
@@ -134,17 +134,17 @@ def cmd_doctor(args) -> int:
 
     # The task repo is auto-cloned on `dradar go`; do it here too so a missing
     # checkout reports OK instead of a FAIL whose hint doesn't actually fix it.
-    tasks_root = cfg.get("tasks_root")
-    if tasks_root and not Path(tasks_root).expanduser().is_dir():
+    tasks_root = tasks_root_from_config(cfg)
+    if not tasks_root.is_dir():
         try:
-            runner.ensure_tasks_root(Path(tasks_root).expanduser())
+            runner.ensure_tasks_root(tasks_root)
         except runner.RunnerError:
             pass
     all_ok &= _check(
         "tasks_root",
-        bool(tasks_root and Path(tasks_root).expanduser().is_dir()),
-        "run `dradar go` once — it auto-clones the task repo" if tasks_root
-        else "dradar login --tasks-root /path/to/deep-swe/tasks",
+        tasks_root.is_dir(),
+        "run `dradar go` once — it auto-clones the task repo at "
+        f"{tasks_root}",
     )
 
     free_gb = shutil.disk_usage(Path.home()).free / 1e9

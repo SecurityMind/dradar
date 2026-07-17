@@ -19,7 +19,7 @@ from pathlib import Path
 from . import __version__, checkpoints, pending
 from .api_client import ApiClient, ApiError
 from .identity import _client
-from .local_config import HOME, _load_config
+from .local_config import HOME, _load_config, tasks_root_from_config
 from .machine import acquire_run_lock, sweep_orphan_compose
 from .runner import (
     DIAG_ADVICE, BuildFlakeError, RunnerError, check_task_content_hash,
@@ -853,10 +853,10 @@ def cmd_go(args) -> int:
         sys.exit("--auto N requires N >= 1")
     cfg = _load_config()
     client = _client(cfg, auto_register=True)
-    tasks_root = cfg.get("tasks_root")
-    if not tasks_root:
-        sys.exit("tasks_root not configured; run: dradar login --tasks-root <deep-swe/tasks>")
-    tasks_root = Path(tasks_root).expanduser()
+    # Pre-default configs may not carry tasks_root at all.  They now get the
+    # same hidden checkout as a fresh login, while any explicit legacy path
+    # remains authoritative.
+    tasks_root = tasks_root_from_config(cfg)
     telemetry = RunnerTelemetry(client)
     telemetry.start()
     close_reason = "error"
