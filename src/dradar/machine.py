@@ -39,6 +39,12 @@ def acquire_run_lock(home: Path) -> None:
     try:
         if os.name == "nt":
             import msvcrt
+            # msvcrt cannot reliably lock a byte beyond EOF. A brand-new
+            # run.lock is empty, so materialize the byte before locking it.
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write("\0")
+                fh.flush()
             fh.seek(0)
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
         else:

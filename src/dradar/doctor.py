@@ -19,9 +19,7 @@ def _check(label: str, ok: bool, hint: str = "") -> bool:
 
 
 def _platform(proc_version: Path = Path("/proc/version")) -> str:
-    """'macos' | 'wsl' | 'linux' | 'windows'. WSL2 is the supported way to run
-    on Windows; native win32 gets a hard stop with setup guidance. Anything
-    else (BSDs...) gets the linux guidance as the closest fit."""
+    """Return the host family used to select platform-specific diagnostics."""
     if sys.platform == "darwin":
         return "macos"
     if sys.platform == "win32":
@@ -61,12 +59,18 @@ _DOCKER_HINTS = {
         "compose": "update Docker Desktop (bundles compose v2), or: "
                    "sudo apt install docker-compose-plugin",
     },
+    "windows": {
+        "cli": "install Docker Desktop: winget install -e --id Docker.DockerDesktop",
+        "daemon": "start Docker Desktop and switch it to Linux containers",
+        "compose": "update Docker Desktop (it includes Docker Compose v2)",
+    },
 }
 
 _CODEX_HINTS = {
     "macos": "brew install codex",
     "linux": "npm install -g @openai/codex",
     "wsl": "npm install -g @openai/codex",
+    "windows": "PowerShell: irm https://chatgpt.com/codex/install.ps1 | iex",
 }
 
 
@@ -83,11 +87,9 @@ def cmd_doctor(args) -> int:
     plat = _platform()
     print(f"dradar {__version__} doctor ({plat})")
     if plat == "windows":
-        _check("platform", False,
-               "native Windows is not supported — run dradar inside WSL2: "
-               "PowerShell (admin): wsl --install, reboot, open Ubuntu, then "
-               "re-run the install script there")
-        return 1
+        print("  native Windows support is experimental — this check validates "
+              "Docker Desktop (Linux containers), Pier, and the Codex CLI; "
+              "WSL2 remains the established fallback")
     hints = _DOCKER_HINTS[plat]
     all_ok = True
 
