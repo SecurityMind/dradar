@@ -585,6 +585,7 @@ def summarize_result(result_path: Path | None) -> dict:
     agent = data.get("agent_result") or {}
     exc = data.get("exception_info") or {}
     return {
+        "cost_usd": agent.get("cost_usd"),
         "n_input_tokens": agent.get("n_input_tokens"),
         "n_cache_tokens": agent.get("n_cache_tokens"),
         "n_output_tokens": agent.get("n_output_tokens"),

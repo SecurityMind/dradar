@@ -448,10 +448,11 @@ def test_trial_timeout_scales_with_estimate():
 
 def test_summarize_result_exception_info_present(tmp_path):
     p = tmp_path / "result.json"
-    p.write_text(json.dumps({"agent_result": {"n_input_tokens": 5},
+    p.write_text(json.dumps({"agent_result": {"cost_usd": 1.23, "n_input_tokens": 5},
                              "exception_info": {"type": "RateLimit"}}))
     s = summarize_result(p)
     assert s["exception_info"] is True and s["n_input_tokens"] == 5
+    assert s["cost_usd"] == 1.23
 
 
 def test_summarize_result_exception_info_absent(tmp_path):
