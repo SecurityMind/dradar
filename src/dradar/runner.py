@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import tomllib
 from collections.abc import Callable
@@ -347,9 +348,14 @@ def ensure_pier() -> None:
         return
     uv = shutil.which("uv")
     if not uv:
+        uv_hint = (
+            "PowerShell: irm https://astral.sh/uv/install.ps1 | iex"
+            if sys.platform == "win32"
+            else "curl -LsSf https://astral.sh/uv/install.sh | sh"
+        )
         raise RunnerError(
             f"Pier {PIER_VERSION} is required but uv is missing -- install uv first: "
-            "curl -LsSf https://astral.sh/uv/install.sh | sh")
+            f"{uv_hint}")
     if pier:
         print(f"Pier {installed_version or 'unknown'} lacks persistent resume — "
               f"installing SecurityMind build {PIER_VERSION}...")

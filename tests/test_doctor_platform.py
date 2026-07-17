@@ -70,9 +70,14 @@ def test_doctor_macos_hints_unchanged(monkeypatch, capsys):
     assert "brew install codex" in out
 
 
-def test_doctor_native_windows_hard_stops_with_wsl_guidance(monkeypatch, capsys):
+def test_doctor_native_windows_runs_real_preflight_with_native_hints(
+    monkeypatch, capsys,
+):
     rc, out = _run_doctor(monkeypatch, capsys, "windows")
     assert rc == 1
-    assert "wsl --install" in out
-    # hard stop: no point probing docker/codex on native Windows
-    assert "docker CLI" not in out
+    assert "native Windows support is experimental" in out
+    assert "docker CLI" in out
+    assert "Docker.DockerDesktop" in out
+    assert "chatgpt.com/codex/install.ps1" in out
+    assert "wsl --install" not in out
+    assert "Ubuntu" not in out

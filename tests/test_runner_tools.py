@@ -237,6 +237,14 @@ def test_ensure_pier_errors_when_no_uv(monkeypatch):
         ensure_pier()
 
 
+def test_ensure_pier_missing_uv_uses_windows_install_hint(monkeypatch):
+    monkeypatch.setattr(runner_mod.shutil, "which", lambda n: None)
+    monkeypatch.setattr(runner_mod.sys, "platform", "win32")
+    with pytest.raises(RunnerError, match=r"install\.ps1") as exc:
+        ensure_pier()
+    assert "install.sh" not in str(exc.value)
+
+
 def test_ensure_tasks_root_noop_when_present(tmp_path, monkeypatch):
     tr = tmp_path / "deep-swe" / "tasks"
     tr.mkdir(parents=True)
