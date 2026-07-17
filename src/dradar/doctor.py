@@ -107,7 +107,8 @@ def cmd_doctor(args) -> int:
     except runner.RunnerError:
         pass
     pier = shutil.which("pier")
-    pier_ready = bool(pier and runner._pier_version(pier) == runner.PIER_VERSION)
+    pier_ready = bool(
+        pier and runner._pier_version_compatible(runner._pier_version(pier)))
     all_ok &= _check("pier", pier_ready, runner.PIER_INSTALL_COMMAND)
 
     # Agent: you only need ONE family working. If the one you're set up for is

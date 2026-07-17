@@ -184,6 +184,15 @@ def test_ensure_pier_noop_when_required_version_present(monkeypatch):
     assert called == []            # approved build -> never installs
 
 
+def test_ensure_pier_accepts_newer_compatible_post_release(monkeypatch):
+    monkeypatch.setattr(runner_mod.shutil, "which", lambda n: "/usr/bin/pier")
+    monkeypatch.setattr(runner_mod, "_pier_version", lambda _: "0.3.0.post3")
+    called = []
+    monkeypatch.setattr(runner_mod.subprocess, "run", lambda *a, **k: called.append(a))
+    ensure_pier()
+    assert called == []
+
+
 def test_ensure_pier_installs_via_uv_when_missing(monkeypatch):
     seen = {"pier": None}  # pier missing first, present after "install"
     def which(name):
@@ -427,20 +436,23 @@ def test_trial_timeout_defaults_and_floor():
     # missing/None estimate falls back to 30 min -> 30*60*4
     assert _trial_timeout_sec({}) == 7200
     assert _trial_timeout_sec({"est_minutes": None}) == 7200
-    assert _trial_timeout_sec({"est_minutes": 5}) == 1800   # floor wins
+    assert _trial_timeout_sec({"est_minutes": 5}) == 3600   # floor wins
+    assert _trial_timeout_sec({"est_minutes": 10}) == 3600  # floor wins
 
 
 def test_trial_timeout_scales_with_estimate():
+    assert _trial_timeout_sec({"est_minutes": 20}) == 4800
     assert _trial_timeout_sec({"est_minutes": 30}) == 7200
     assert _trial_timeout_sec({"est_minutes": 120}) == 28800
 
 
 def test_summarize_result_exception_info_present(tmp_path):
     p = tmp_path / "result.json"
-    p.write_text(json.dumps({"agent_result": {"n_input_tokens": 5},
+    p.write_text(json.dumps({"agent_result": {"cost_usd": 1.23, "n_input_tokens": 5},
                              "exception_info": {"type": "RateLimit"}}))
     s = summarize_result(p)
     assert s["exception_info"] is True and s["n_input_tokens"] == 5
+    assert s["cost_usd"] == 1.23
 
 
 def test_summarize_result_exception_info_absent(tmp_path):

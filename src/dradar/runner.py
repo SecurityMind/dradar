@@ -9,6 +9,7 @@ import glob
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -325,11 +326,24 @@ def _pier_version(pier: str) -> str | None:
     return proc.stdout.strip() or None
 
 
+def _pier_version_compatible(installed_version: str | None) -> bool:
+    """Accept the pinned checkpoint build and compatible later post releases."""
+    if installed_version == PIER_VERSION:
+        return True
+    required = re.fullmatch(r"(.+)\.post(\d+)", PIER_VERSION)
+    installed = re.fullmatch(r"(.+)\.post(\d+)", installed_version or "")
+    return bool(
+        required and installed
+        and installed.group(1) == required.group(1)
+        and int(installed.group(2)) >= int(required.group(2))
+    )
+
+
 def ensure_pier() -> None:
     """Ensure the pinned Pier build with persistent-resume support is active."""
     pier = shutil.which("pier")
     installed_version = _pier_version(pier) if pier else None
-    if installed_version == PIER_VERSION:
+    if _pier_version_compatible(installed_version):
         return
     uv = shutil.which("uv")
     if not uv:
@@ -344,7 +358,7 @@ def ensure_pier() -> None:
     proc = subprocess.run([uv, "tool", "install", "--force", PIER_SPEC])
     active_pier = shutil.which("pier")
     active_version = _pier_version(active_pier) if active_pier else None
-    if proc.returncode != 0 or active_version != PIER_VERSION:
+    if proc.returncode != 0 or not _pier_version_compatible(active_version):
         raise RunnerError(
             f"couldn't activate Pier {PIER_VERSION}; run `{PIER_INSTALL_COMMAND}` "
             "yourself and make sure ~/.local/bin precedes other Pier installs on PATH")
@@ -432,9 +446,9 @@ def _last_activity(log_path: Path) -> str:
 
 def _trial_timeout_sec(assignment: dict) -> int:
     """Cap for one trial: a generous multiple of the server's estimate, with
-    a floor for image pull/build."""
+    a one-hour floor for image pull/build and long model turns."""
     est_min = assignment.get("est_minutes") or 30
-    return max(1800, int(est_min) * 60 * 4)
+    return max(3600, int(est_min) * 60 * 4)
 
 
 def run_trial(
@@ -571,6 +585,7 @@ def summarize_result(result_path: Path | None) -> dict:
     agent = data.get("agent_result") or {}
     exc = data.get("exception_info") or {}
     return {
+        "cost_usd": agent.get("cost_usd"),
         "n_input_tokens": agent.get("n_input_tokens"),
         "n_cache_tokens": agent.get("n_cache_tokens"),
         "n_output_tokens": agent.get("n_output_tokens"),
