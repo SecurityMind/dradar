@@ -23,7 +23,8 @@ from .doctor import cmd_doctor
 from .identity import cmd_link_github, cmd_login, cmd_rename, cmd_status
 from .leases import cmd_leases, cmd_release
 from .runloop import (
-    cmd_checkpoint_discard, cmd_checkpoints, cmd_go, cmd_retry_upload,
+    cmd_checkpoint_discard, cmd_checkpoints, cmd_cleanup, cmd_go,
+    cmd_retry_upload,
 )
 
 __all__ = ["main"]
@@ -79,6 +80,19 @@ def main(argv: list[str] | None = None) -> int:
         "retry-upload",
         help="flush any trials that ran but failed to upload (also runs automatically before `go`)")
     p_retry.set_defaults(func=cmd_retry_upload, lease_hint=True)
+
+    p_cleanup = sub.add_parser(
+        "cleanup", help="safely remove settled local task files")
+    p_cleanup.add_argument(
+        "--dry-run", action="store_true",
+        help="show what can be removed without deleting anything",
+    )
+    p_cleanup.add_argument(
+        "--include-kept", action="store_true",
+        help="also remove task files explicitly protected by --keep",
+    )
+    p_cleanup.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
+    p_cleanup.set_defaults(func=cmd_cleanup)
 
     p_cp_list = sub.add_parser(
         "checkpoints", help="list resumable local checkpoints and their disk usage")

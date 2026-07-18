@@ -19,6 +19,7 @@ from typing import Iterator
 
 SCHEMA_VERSION = 1
 DEFAULT_TTL_DAYS = 7
+KEEP_MARKER = ".dradar-keep"
 _SENSITIVE_KEY_PARTS = ("token", "secret", "password", "credential", "api_key", "auth")
 _ASSIGNMENT_FROM_JOB = re.compile(r"^a([0-9a-f]{32})(?:-|$)")
 
@@ -188,6 +189,16 @@ def _safe_job_dir(home: Path, item: Checkpoint) -> Path:
 
 def remove(home: Path, item: Checkpoint) -> None:
     shutil.rmtree(_safe_job_dir(home, item), ignore_errors=True)
+
+
+def mark_kept(home: Path, item: Checkpoint) -> None:
+    """Protect a settled job from the default ``dradar cleanup`` sweep."""
+    marker = _safe_job_dir(home, item) / KEEP_MARKER
+    marker.touch(mode=0o600, exist_ok=True)
+
+
+def is_kept(home: Path, item: Checkpoint) -> bool:
+    return (_safe_job_dir(home, item) / KEEP_MARKER).is_file()
 
 
 def cleanup_assignment(
