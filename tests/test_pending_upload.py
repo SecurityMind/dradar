@@ -137,6 +137,59 @@ def test_upload_success_removes_current_and_superseded_checkpoint_jobs(
     assert not any(job.exists() for job in jobs)
 
 
+def test_interactive_upload_defaults_to_cleaning_local_job(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    job = tmp_path / "work" / "jobs" / f"a{'2' * 32}-one"
+    trial = job / "task__one"
+    checkpoint = trial / "agent" / "checkpoint"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "checkpoint.json").write_text(json.dumps({
+        "schema_version": 1, "checkpoint_id": "checkpoint-clean123",
+        "assignment_id": "2" * 32, "phase": "agent_completed",
+        "updated_at": "2026-07-18T01:00:00Z", "resume_generation": 0,
+    }))
+    (trial / "artifacts").mkdir()
+    (trial / "artifacts" / "model.patch").write_text("diff --git a b\n")
+    monkeypatch.setattr("builtins.input", lambda _prompt: "")
+    outcome = runloop._upload_trial(
+        FakeClient(lambda _aid: {"submission_id": "s1", "grade_status": "pending"}),
+        _entry(trial, assignment_id="2" * 32, job_dir=str(job), keep=False),
+        ask_cleanup=True,
+    )
+    assert outcome == "submitted"
+    assert not job.exists()
+    assert "local task files cleaned" in capsys.readouterr().out
+
+
+def test_interactive_upload_can_keep_and_protect_local_job(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    job = tmp_path / "work" / "jobs" / f"a{'3' * 32}-one"
+    trial = job / "task__one"
+    checkpoint = trial / "agent" / "checkpoint"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "checkpoint.json").write_text(json.dumps({
+        "schema_version": 1, "checkpoint_id": "checkpoint-keep1234",
+        "assignment_id": "3" * 32, "phase": "agent_completed",
+        "updated_at": "2026-07-18T01:00:00Z", "resume_generation": 0,
+    }))
+    (trial / "artifacts").mkdir()
+    (trial / "artifacts" / "model.patch").write_text("diff --git a b\n")
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+    outcome = runloop._upload_trial(
+        FakeClient(lambda _aid: {"submission_id": "s1", "grade_status": "pending"}),
+        _entry(trial, assignment_id="3" * 32, job_dir=str(job), keep=False),
+        ask_cleanup=True,
+    )
+    assert outcome == "submitted"
+    assert job.is_dir()
+    assert (job / ".dradar-keep").is_file()
+    assert "local artifacts kept" in capsys.readouterr().out
+
+
 def test_upload_failure_records_ledger_entry(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     trial_dir = _make_trial_dir(tmp_path)

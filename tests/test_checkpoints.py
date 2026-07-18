@@ -125,6 +125,9 @@ class _RecoveryClient:
         self.discards.append((assignment_id, checkpoint_id, generation, reason))
         return {"ok": True}
 
+    def get_assignment(self):
+        return {"active": [self.assignment] if self.assignment else []}
+
 
 def test_resume_one_passes_checkpoint_and_new_generation_to_runner(
     tmp_path: Path, monkeypatch,
@@ -168,3 +171,60 @@ def test_invalid_checkpoint_discards_server_lease_and_all_local_copies(
     assert outcome == "discarded"
     assert client.discards[0][3] == "invalid"
     assert checkpoints.scan(tmp_path) == []
+
+
+def test_cleanup_only_removes_server_settled_unprotected_jobs(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    _make_checkpoint(tmp_path, "6" * 32, suffix="active")
+    _make_checkpoint(tmp_path, "7" * 32, suffix="pending")
+    _make_checkpoint(tmp_path, "8" * 32, phase="agent_completed", suffix="kept")
+    _make_checkpoint(tmp_path, "9" * 32, phase="agent_completed", suffix="settled")
+    active = checkpoints.find_latest(tmp_path, "6" * 32)
+    pending_item = checkpoints.find_latest(tmp_path, "7" * 32)
+    kept = checkpoints.find_latest(tmp_path, "8" * 32)
+    settled = checkpoints.find_latest(tmp_path, "9" * 32)
+    assert active and pending_item and kept and settled
+    checkpoints.mark_kept(tmp_path, kept)
+    from dradar import pending
+    pending.record(tmp_path, {"assignment_id": pending_item.assignment_id})
+
+    client = _RecoveryClient(_assignment(active.assignment_id))
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_load_config", lambda: {})
+    monkeypatch.setattr(runloop, "_client", lambda _cfg: client)
+
+    dry = argparse.Namespace(dry_run=True, include_kept=False, yes=True)
+    assert runloop.cmd_cleanup(dry) == 0
+    assert all(item.job_dir.is_dir() for item in (active, pending_item, kept, settled))
+
+    args = argparse.Namespace(dry_run=False, include_kept=False, yes=True)
+    assert runloop.cmd_cleanup(args) == 0
+    assert active.job_dir.is_dir()
+    assert pending_item.job_dir.is_dir()
+    assert kept.job_dir.is_dir()
+    assert not settled.job_dir.exists()
+    out = capsys.readouterr().out
+    assert "protected: 1 active/resumable, 1 pending upload, 1 explicitly kept" in out
+
+    include_kept = argparse.Namespace(dry_run=False, include_kept=True, yes=True)
+    assert runloop.cmd_cleanup(include_kept) == 0
+    assert not kept.job_dir.exists()
+    assert active.job_dir.is_dir() and pending_item.job_dir.is_dir()
+
+
+def test_cleanup_network_failure_deletes_nothing(tmp_path: Path, monkeypatch, capsys):
+    item = _make_checkpoint(tmp_path, "a" * 32, phase="agent_completed")
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_load_config", lambda: {})
+
+    class Offline:
+        def get_assignment(self):
+            from dradar.api_client import ApiError
+            raise ApiError("offline")
+
+    monkeypatch.setattr(runloop, "_client", lambda _cfg: Offline())
+    args = argparse.Namespace(dry_run=False, include_kept=True, yes=True)
+    assert runloop.cmd_cleanup(args) == 1
+    assert item.job_dir.is_dir()
+    assert "nothing was deleted" in capsys.readouterr().out

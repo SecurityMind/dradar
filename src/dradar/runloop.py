@@ -255,7 +255,9 @@ def _check_version_pin(pinned: str | None, tasks_root: Path, allow_drift: bool) 
 _artifacts_from_trial_dir = trial_artifact_paths
 
 
-def _upload_trial(client: ApiClient, entry: dict) -> str:
+def _upload_trial(
+    client: ApiClient, entry: dict, *, ask_cleanup: bool = False,
+) -> str:
     """Scrub + upload one trial's artifacts, described by a pending-ledger
     entry dict (assignment_id/nonce/task_id/trial_dir/meta/outcome/job_dir/
     keep) — the same shape the ledger round-trips, so what persists on failure
@@ -279,7 +281,10 @@ def _upload_trial(client: ApiClient, entry: dict) -> str:
     job_dir = Path(entry["job_dir"]) if entry.get("job_dir") else None
 
     def cleanup_settled() -> None:
-        keep_dir = job_dir if entry.get("keep", False) else None
+        # During an interactive completed run, keep the current directory
+        # just long enough to ask the volunteer. Superseded checkpoint copies
+        # are still removed immediately.
+        keep_dir = job_dir if (entry.get("keep", False) or ask_cleanup) else None
         checkpoints.cleanup_assignment(
             HOME, assignment_id, keep_job_dir=keep_dir,
         )
@@ -375,6 +380,9 @@ def _upload_trial(client: ApiClient, entry: dict) -> str:
     else:
         print(f"submitted: {ack['submission_id']} (grading happens server-side)")
     if job_dir and entry.get("keep", False):
+        item = checkpoints.find_latest(HOME, assignment_id)
+        if item is not None and item.job_dir.resolve() == job_dir.resolve():
+            checkpoints.mark_kept(HOME, item)
         print(f"  local artifacts kept by --keep: {job_dir}")
     elif job_dir:
         if outcome == "interrupted":
@@ -383,6 +391,17 @@ def _upload_trial(client: ApiClient, entry: dict) -> str:
             # client-side. Completed runs stay tidy-by-default as before.
             if Path(job_dir).is_dir():
                 print(f"  failure artifacts kept for diagnosis: {job_dir}")
+        elif ask_cleanup and Path(job_dir).is_dir():
+            answer = input("  delete this task's local files now? [Y/n] ").strip().lower()
+            if answer in ("", "y", "yes"):
+                shutil.rmtree(job_dir, ignore_errors=True)
+                print("  local task files cleaned")
+            else:
+                item = checkpoints.find_latest(HOME, assignment_id)
+                if item is not None and item.job_dir.resolve() == job_dir.resolve():
+                    checkpoints.mark_kept(HOME, item)
+                print(f"  local artifacts kept: {job_dir}  "
+                      "(`dradar cleanup --include-kept` removes them later)")
         else:
             shutil.rmtree(job_dir, ignore_errors=True)
     return "interrupted" if outcome == "interrupted" else "submitted"
@@ -570,7 +589,12 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "meta": meta, "outcome": outcome,
         "job_dir": str(art.job_dir) if art.job_dir else None, "keep": args.keep,
         "resume_generation": assignment.get("resume_generation", 0),
-    })
+    }, ask_cleanup=(
+        outcome == "completed"
+        and not args.keep
+        and not getattr(args, "yes", False)
+        and not getattr(args, "parallel", False)
+    ))
 
 
 def _retry_pending_uploads(client: ApiClient) -> None:
@@ -706,6 +730,11 @@ def _resume_one_checkpoint(
                     client,
                     _checkpoint_upload_entry(
                         item, assignment, args, local_commit,
+                    ),
+                    ask_cleanup=(
+                        not args.keep
+                        and not getattr(args, "yes", False)
+                        and not getattr(args, "parallel", False)
                     ),
                 )
 
@@ -844,6 +873,74 @@ def cmd_checkpoint_discard(args) -> int:
         )
     print("checkpoint discarded; its cell is open again" if ok else "checkpoint kept")
     return 0 if ok else 1
+
+
+def cmd_cleanup(args) -> int:
+    """Remove only local jobs proven safe by current server state.
+
+    A network failure aborts the whole sweep: without an authoritative active
+    lease list, an ``agent_completed`` checkpoint may be a finished trial that
+    crashed immediately before its upload ledger was recorded.
+    """
+    cfg = _load_config()
+    client = _client(cfg)
+    try:
+        active_ids = set(_active_by_id(client))
+    except ApiError as exc:
+        print(f"cleanup stopped: couldn't verify active assignments ({exc})")
+        print("nothing was deleted")
+        return 1
+
+    pending_ids = {
+        entry.get("assignment_id") for entry in pending.load(HOME)
+        if entry.get("assignment_id")
+    }
+    candidates: list[checkpoints.Checkpoint] = []
+    protected_active = protected_pending = protected_kept = 0
+    seen_jobs: set[Path] = set()
+    for item in checkpoints.scan(HOME):
+        job = item.job_dir.resolve()
+        if job in seen_jobs:
+            continue
+        seen_jobs.add(job)
+        if item.assignment_id in pending_ids:
+            protected_pending += 1
+            continue
+        if item.assignment_id in active_ids:
+            protected_active += 1
+            continue
+        if checkpoints.is_kept(HOME, item) and not args.include_kept:
+            protected_kept += 1
+            continue
+        candidates.append(item)
+
+    total = sum(item.size_bytes for item in candidates)
+    if not candidates:
+        print("nothing safe to clean")
+    else:
+        action = "would remove" if args.dry_run else "ready to remove"
+        print(f"{action} {len(candidates)} settled local task(s), {_format_size(total)}")
+        for item in candidates:
+            kept = " [kept]" if checkpoints.is_kept(HOME, item) else ""
+            print(f"  {item.task_id or '?'}  assignment={item.assignment_id or '?'}  "
+                  f"{_format_size(item.size_bytes)}{kept}")
+
+    if protected_active or protected_pending or protected_kept:
+        print("protected: "
+              f"{protected_active} active/resumable, "
+              f"{protected_pending} pending upload, "
+              f"{protected_kept} explicitly kept")
+    if not candidates or args.dry_run:
+        return 0
+    if not args.yes:
+        answer = input("remove these settled local task files? [Y/n] ").strip().lower()
+        if answer not in ("", "y", "yes"):
+            print("nothing was deleted")
+            return 0
+    for item in candidates:
+        checkpoints.remove(HOME, item)
+    print(f"cleaned {len(candidates)} task(s); freed {_format_size(total)}")
+    return 0
 
 
 def cmd_go(args) -> int:
