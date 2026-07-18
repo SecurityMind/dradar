@@ -16,7 +16,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, checkpoints, pending
+from . import __version__, checkpoints, pending, refill as refill_plan
 from .api_client import ApiClient, ApiError
 from .identity import _client
 from .local_config import HOME, _load_config, tasks_root_from_config
@@ -875,6 +875,37 @@ def cmd_checkpoint_discard(args) -> int:
     return 0 if ok else 1
 
 
+def cmd_refill_status(args) -> int:
+    plan = refill_plan.load(HOME)
+    if not plan:
+        print("no local refill plan")
+        return 0
+    quota = plan.get("max_estimated_quota_pct")
+    reserved = sum(
+        float(item.get("estimated_quota_pct") or 0)
+        for item in plan.get("assignments", {}).values()
+    )
+    quota_text = (f"{reserved:.2f}% / {quota}% {plan.get('quota_tier', 'plus')}"
+                  if quota is not None else "not set")
+    print(f"refill plan {plan.get('plan_id', '?')}  status={plan.get('status', '?')}")
+    print(f"  queue target: {plan.get('refill_to', '?')}")
+    print(f"  task budget: {len(plan.get('assignments', {}))}/{plan.get('max_tasks', '?')}")
+    print(f"  estimated quota cap: {quota_text}")
+    if plan.get("stop_reason"):
+        print(f"  note: {plan['stop_reason']}")
+    return 0
+
+
+def cmd_refill_stop(args) -> int:
+    plan = refill_plan.stop(HOME, "stopped by user")
+    if not plan:
+        print("no local refill plan")
+        return 0
+    print("continuous refill stopped — no more tasks will be claimed; "
+          "already held/running tasks were left untouched")
+    return 0
+
+
 def cmd_cleanup(args) -> int:
     """Remove only local jobs proven safe by current server state.
 
@@ -948,6 +979,24 @@ def cmd_go(args) -> int:
         sys.exit("--auto and --pick are two different ways to choose cells; pass only one")
     if getattr(args, "auto", None) is not None and args.auto < 1:
         sys.exit("--auto N requires N >= 1")
+    if getattr(args, "refill_to", None) is not None:
+        args.refill = True
+    refill_options = (
+        getattr(args, "max_tasks", None),
+        getattr(args, "max_estimated_quota_pct", None),
+    )
+    if any(value is not None for value in refill_options) and not getattr(args, "refill", False):
+        sys.exit("--max-tasks/--max-estimated-quota-pct require --refill")
+    if getattr(args, "refill", False):
+        if getattr(args, "assignment", None):
+            sys.exit("continuous refill cannot be combined with --assignment")
+        if args.max_tasks is None or args.max_tasks < 1:
+            sys.exit("--refill requires --max-tasks N (N >= 1)")
+        if args.refill_to is not None and args.refill_to < 1:
+            sys.exit("--refill-to N requires N >= 1")
+        if (args.max_estimated_quota_pct is not None
+                and args.max_estimated_quota_pct <= 0):
+            sys.exit("--max-estimated-quota-pct must be greater than 0")
     cfg = _load_config()
     client = _client(cfg, auto_register=True)
     # Pre-default configs may not carry tasks_root at all.  They now get the
@@ -1008,9 +1057,13 @@ def cmd_go(args) -> int:
         close_reason = "completed" if rc == 0 else "paused"
         return rc
     except (KeyboardInterrupt, EOFError):
+        if getattr(args, "refill", False):
+            refill_plan.stop(HOME, "interrupted by user")
         close_reason = "interrupted"
         raise
     finally:
+        if getattr(args, "refill", False) and close_reason == "error":
+            refill_plan.stop(HOME, "CLI exited unexpectedly")
         telemetry.close(close_reason)
 
 
@@ -1101,6 +1154,9 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                                       args.allow_task_drift)
     results, failed_ids = [], set()
     while True:
+        if getattr(args, "refill", False) and not refill_plan.is_running(HOME):
+            print("continuous refill is stopped; leaving already held tasks for a later resume")
+            break
         try:
             # A failed local cell is marked stopped so it is retryable later,
             # but this session must not immediately take the same cell again.
@@ -1135,6 +1191,8 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                 _exit_for(exc)
         assignment = data.get("assignment")
         if not assignment:
+            if getattr(args, "refill", False):
+                refill_plan.complete_if_empty(HOME, int(data.get("held") or 0))
             if not results:
                 print("nothing left to start — every held cell is already "
                       "checked out (another session?) or submitted. "
@@ -1170,6 +1228,32 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
         fail_fast = os.environ.get("DRADAR_BATCH_FAIL_FAST", "").lower() in {
             "1", "true", "yes", "on",
         }
+        if getattr(args, "refill", False):
+            if outcome != "submitted":
+                refill_plan.stop(HOME, f"task outcome={outcome}")
+                print(f"continuous refill stopped after outcome={outcome}; no new tasks "
+                      "will be claimed, and existing leases/checkpoints stay untouched")
+                results.append(outcome)
+                break
+            try:
+                replenished = refill_plan.refill_once(HOME, client)
+            except ApiError as exc:
+                # One attempt per completed task is naturally bounded by task
+                # duration. Do not busy-loop; existing held work remains safe.
+                print(f"auto-refill unavailable for now ({exc}); continuing the held queue "
+                      "without retrying in a tight loop")
+            else:
+                claimed = replenished.get("claimed", 0)
+                held = replenished.get("held", data.get("held", "?"))
+                target = (refill_plan.load(HOME) or {}).get("refill_to", "?")
+                if claimed:
+                    print(f"submitted 1 task; held {held}/{target}; auto-claimed {claimed}")
+                elif replenished.get("status") == "draining":
+                    print("refill limit reached; no more tasks will be claimed, "
+                          "draining the existing queue")
+                elif replenished.get("status") == "stopped":
+                    print(f"continuous refill stopped: "
+                          f"{replenished.get('reason') or 'safety limit reached'}")
         if fail_fast and outcome != "submitted":
             # Large operator-managed batches should fail closed: continuing to
             # drain the queue turned one shared proxy incident into 27 invalid
@@ -1186,6 +1270,113 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
     return 0 if ok else 1
 
 
+def _prompt_positive_int(prompt: str, default: int) -> int:
+    raw = input(f"{prompt} [{default}]: ").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise refill_plan.RefillError(f"{prompt} must be a positive integer")
+    return value
+
+
+def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) -> list[dict]:
+    """Configure/attach one shared plan, then perform its initial bounded top-up."""
+    explicit = getattr(args, "refill", False)
+    if not explicit and not args.yes and free_pick and active:
+        answer = input(
+            f"you selected {len(active)} task(s). Keep auto-refilling as they finish? [y/N] "
+        ).strip().lower()
+        if answer not in ("y", "yes"):
+            return active
+        args.refill = True
+        args.refill_to = _prompt_positive_int("held queue target", len(active))
+        args.max_tasks = _prompt_positive_int(
+            "maximum tasks for this refill plan", max(len(active) * 2, len(active) + 1))
+        tier = input("quota tier [plus/pro-5x/pro-20x] [plus]: ").strip().lower()
+        args.quota_tier = tier or "plus"
+        quota = input("estimated 7-day quota cap in percent (blank for task cap only): ").strip()
+        try:
+            args.max_estimated_quota_pct = float(quota) if quota else None
+        except ValueError as exc:
+            raise refill_plan.RefillError("estimated quota cap must be a number") from exc
+        explicit = True
+    if not explicit:
+        return active
+    if not free_pick:
+        raise refill_plan.RefillError("continuous refill is not available on this server")
+
+    try:
+        me = client.whoami()
+    except ApiError as exc:
+        raise refill_plan.RefillError(f"couldn't read account refill limits: {exc}") from exc
+    if me.get("claim_limit") is None or me.get("concurrent_limit") is None:
+        raise refill_plan.RefillError(
+            "this server is too old for safe continuous refill; ordinary go/resume is unchanged"
+        )
+    requested = (
+        getattr(args, "refill_to", None)
+        or getattr(args, "auto", None)
+        or len(active)
+        or 1
+    )
+    target = min(int(requested), int(me["claim_limit"]), int(args.max_tasks))
+    if target != requested:
+        print(f"refill target {requested} exceeds the applicable claim/task limit; using {target}")
+    if args.max_tasks is None or args.max_tasks < len(active):
+        raise refill_plan.RefillError(
+            f"--max-tasks must be at least the {len(active)} task(s) already held"
+        )
+    if args.quota_tier not in refill_plan.TIERS:
+        raise refill_plan.RefillError(f"unknown quota tier: {args.quota_tier}")
+    if args.max_estimated_quota_pct is not None and args.max_estimated_quota_pct <= 0:
+        raise refill_plan.RefillError("estimated quota cap must be greater than zero")
+
+    print("continuous refill plan:")
+    print(f"  held queue target: {target} (server claim limit {me['claim_limit']})")
+    print(f"  server concurrent limit: {me['concurrent_limit']}")
+    print(f"  hard task cap: {args.max_tasks}")
+    if args.max_estimated_quota_pct is not None:
+        print(f"  estimated quota cap: {args.max_estimated_quota_pct}% {args.quota_tier}")
+    print("  safety: any non-submitted task stops refill; existing work is never released")
+    if not args.yes:
+        answer = input("start this refill plan? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("continuous refill not started; running only the selected tasks")
+            args.refill = False
+            return active
+
+    plan = refill_plan.configure(
+        HOME,
+        volunteer_id=me.get("volunteer_id", "unknown"),
+        refill_to=target,
+        max_tasks=args.max_tasks,
+        quota_tier=args.quota_tier,
+        max_estimated_quota_pct=args.max_estimated_quota_pct,
+        active=active,
+    )
+    args.yes = True  # the one campaign confirmation replaces per-task prompts
+    try:
+        result = refill_plan.refill_once(HOME, client)
+    except ApiError as exc:
+        refill_plan.stop(HOME, f"initial refill failed: {exc}")
+        raise refill_plan.RefillError(
+            f"initial refill request failed ({exc}); selected tasks remain held"
+        ) from exc
+    if result.get("claimed"):
+        print(f"initial auto-refill claimed {result['claimed']} task(s); "
+              f"held {result.get('held', '?')}/{target}")
+    elif result.get("status") == "stopped":
+        raise refill_plan.RefillError(result.get("reason") or "refill plan stopped")
+    # Return the authoritative post-refill batch, including claims accepted by
+    # another local worker while this process waited for the shared plan lock.
+    refreshed, _ = _acquire_batch(client, True)
+    return refreshed
+
+
 def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
              telemetry: RunnerTelemetry | None = None) -> int:
     """Run the volunteer's held batch of cells serially: acquire the batch
@@ -1194,11 +1385,12 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
     active, free_pick = _acquire_batch(client, args.yes)
     wants_pick = getattr(args, "pick", None)
     auto_target = getattr(args, "auto", None)
+    wants_refill = getattr(args, "refill", False)
     wants = wants_pick or auto_target is not None
     if active and free_pick and wants_pick:
         print(f"already holding {len(active)} cell(s) — ignoring --pick; "
               "finish those (or `dradar resume`) before claiming exact cells")
-    elif free_pick and auto_target is not None:
+    elif free_pick and auto_target is not None and not wants_refill:
         # --auto is a target batch size, not "claim N more": preserve existing
         # leases and ask only for the shortfall. The server keeps the ordinary
         # account cap while configured super accounts may request larger pools.
@@ -1211,7 +1403,7 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
         else:
             print(f"already holding {len(active)} cell(s) — --auto target "
                   f"{auto_target} already met")
-    elif not active and free_pick and wants:
+    elif not active and free_pick and wants_pick:
         # Free-pick instances normally need a prior web claim; --auto/--pick
         # claim straight from the CLI instead (volunteer issue #1,
         # 2026-07-15) so an Agent never has to touch the web UI at all.
@@ -1219,6 +1411,12 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
             active = _claim_picks(client, args.pick)
         except ApiError as exc:
             _exit_for(exc)
+    try:
+        active = _setup_refill(args, client, active, free_pick)
+    except refill_plan.RefillError as exc:
+        refill_plan.stop(HOME, str(exc))
+        print(f"continuous refill not started: {exc}")
+        args.refill = False
     if not active:
         if free_pick and wants:
             print("nothing claimed — try again, or pick on the radar page instead.")
@@ -1241,6 +1439,10 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
         rc = _run_checkout_loop(args, client, tasks_root, active, telemetry=telemetry)
         if rc is not None:
             return rc
+        if getattr(args, "refill", False):
+            refill_plan.stop(HOME, "server has no atomic checkout endpoint")
+            print("continuous refill stopped: this server lacks atomic checkout support")
+            return 1
     rc = _run_batch(args, client, tasks_root, active, telemetry=telemetry)
     # Free-pick: the batch was a snapshot taken at startup, but the classic
     # first-session flow is "paste the command, then go claim more on the

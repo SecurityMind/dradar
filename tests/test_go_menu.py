@@ -252,7 +252,8 @@ def test_skip_in_a_batch_moves_to_the_next_cell(monkeypatch, capsys, tmp_path: P
     ran = []
     _patch_run(monkeypatch, ran=ran)
     # 's' skips cell 1, 'y' runs cell 2
-    answers = iter(["s", "y"])
+    # Decline continuous refill, then skip cell 1 and run cell 2.
+    answers = iter(["n", "s", "y"])
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
     batch = [{**ASSIGNMENT, "assignment_id": "a1"}, {**ASSIGNMENT, "assignment_id": "a2"}]
     client = FakeClient({"active": batch, "free_pick": True, "menu": None})
