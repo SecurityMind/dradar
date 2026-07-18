@@ -1,5 +1,6 @@
 import argparse
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -153,6 +154,47 @@ def test_resume_one_passes_checkpoint_and_new_generation_to_runner(
     assert client.resumes[0][2] == 2
     assert seen["assignment"]["resume_generation"] == 3
     assert seen["checkpoint"].checkpoint_id == item.checkpoint_id
+
+
+def test_healthy_local_run_holds_assignment_lock_before_checkpoint_resume(
+    tmp_path: Path, monkeypatch,
+):
+    """A checkpoint written by an active first run is not resumable locally."""
+    aid = "b" * 32
+    item = _make_checkpoint(tmp_path, aid)
+    assignment = _assignment(aid)
+    client = _RecoveryClient(assignment)
+    entered = threading.Event()
+    release = threading.Event()
+    result = []
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "check_task_content_hash", lambda *a, **k: True)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+    monkeypatch.setattr(runloop, "_pause_checkpoint_quietly", lambda *a, **k: None)
+    monkeypatch.setattr(runloop, "_mark_stopped_quietly", lambda *a, **k: None)
+
+    def blocking_trial(*_a, **_kw):
+        entered.set()
+        assert release.wait(5)
+        raise runloop.RunnerError("test stop")
+
+    monkeypatch.setattr(runloop, "run_trial", blocking_trial)
+    worker = threading.Thread(target=lambda: result.append(
+        runloop._run_and_submit(
+            client, assignment, tmp_path / "tasks", _args(), "base",
+        )
+    ))
+    worker.start()
+    assert entered.wait(5)
+    try:
+        assert runloop._resume_one_checkpoint(
+            client, item, assignment, _args(), tmp_path / "tasks", None,
+        ) == "busy"
+        assert client.resumes == []
+    finally:
+        release.set()
+        worker.join(5)
+    assert result == ["failed"]
 
 
 def test_invalid_checkpoint_discards_server_lease_and_all_local_copies(

@@ -163,6 +163,31 @@ def test_setup_clamps_target_to_server_claim_limit(tmp_path: Path, monkeypatch, 
     assert "using 3" in capsys.readouterr().out
 
 
+def test_invalid_new_setup_cannot_stop_existing_shared_plan(
+    tmp_path: Path, monkeypatch,
+):
+    active = [_assignment("a1")]
+    client = RefillClient(active)
+    _configure(tmp_path, active, refill_to=1, max_tasks=3)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_acquire_batch", lambda *_a, **_k: (active, True))
+    monkeypatch.setattr(
+        runloop, "_setup_refill",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            refill.RefillError("held queue target must be a positive integer")
+        ),
+    )
+    monkeypatch.setattr(runloop, "_run_checkout_loop", lambda *_a, **_k: 0)
+    args = argparse.Namespace(
+        yes=True, pick=None, auto=None, refill=True, resume=True,
+    )
+
+    assert runloop._go_menu(args, {}, client, tmp_path) == 0
+    plan = refill.load(tmp_path)
+    assert plan["status"] == "active"
+    assert plan["stop_reason"] is None
+
+
 def test_non_submitted_outcome_stops_shared_plan(tmp_path: Path, monkeypatch):
     from test_checkout import CheckoutClient, _cell
     from test_go_menu import _args
@@ -207,4 +232,60 @@ def test_checkout_loop_refills_until_hard_cap_then_drains(
     assert runloop._run_checkout_loop(args, client, tmp_path, [first]) == 0
     assert len(ran) == 3
     assert len(client.claimed) == 2
+    assert refill.load(tmp_path)["status"] == "completed"
+
+
+def test_two_workers_keep_draining_after_total_claim_cap(
+    tmp_path: Path, monkeypatch,
+):
+    """Regression for the live 2-running + 1-waiting idle-slot incident."""
+    from test_go_menu import _args
+
+    initial = [_assignment("a1"), _assignment("a2"), _assignment("a3")]
+    for assignment in initial:
+        assignment.update(
+            agent="codex", expires_at="2099-01-01T00:00:00Z",
+            deep_swe_commit=None,
+        )
+    client = LoopClient(initial)
+    _configure(tmp_path, initial, refill_to=3, max_tasks=5)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    running = 0
+    peak_running = 0
+    completed = []
+    state_lock = threading.Lock()
+    both_started = threading.Barrier(2)
+
+    def run(_client, assignment, *_a, **_kw):
+        nonlocal running, peak_running
+        with state_lock:
+            running += 1
+            peak_running = max(peak_running, running)
+        # Synchronize only the first pair. Later tasks should be consumed by
+        # whichever worker becomes free without serializing the whole test.
+        if assignment["assignment_id"] in {"a1", "a2"}:
+            both_started.wait(5)
+        with state_lock:
+            completed.append(assignment["assignment_id"])
+            running -= 1
+        client.submit_locally(assignment["assignment_id"])
+        return "submitted"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+
+    def worker():
+        args = _args()
+        args.refill = True
+        return runloop._run_checkout_loop(args, client, tmp_path, initial)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _n: worker(), range(2)))
+
+    assert results == [0, 0]
+    assert peak_running == 2
+    assert len(completed) == 5
+    assert len(set(completed)) == 5
+    assert len(client.claimed) == 2
+    assert client.active == []
     assert refill.load(tmp_path)["status"] == "completed"

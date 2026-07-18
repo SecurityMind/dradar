@@ -486,9 +486,29 @@ def _pause_checkpoint_quietly(
 def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     args, local_commit: str | None,
                     telemetry: RunnerTelemetry | None = None,
-                    resume_checkpoint: checkpoints.Checkpoint | None = None) -> str:
+                    resume_checkpoint: checkpoints.Checkpoint | None = None,
+                    _assignment_lock_held: bool = False) -> str:
     """Run one assignment and upload the artifacts. Returns an outcome tag —
     never exits, so the held-batch loop can carry on with the next item."""
+    # The assignment lock must cover the whole quota-consuming lifetime, not
+    # just checkpoint recovery.  Otherwise a second `dradar resume` can see
+    # the checkpoint written by a healthy first run, ask the server for a new
+    # recovery generation, and start a duplicate Codex process before Pier's
+    # own job/container checks get a chance to reject it.
+    if not _assignment_lock_held:
+        try:
+            with checkpoints.assignment_lock(HOME, assignment["assignment_id"]):
+                return _run_and_submit(
+                    client, assignment, tasks_root, args, local_commit,
+                    telemetry=telemetry, resume_checkpoint=resume_checkpoint,
+                    _assignment_lock_held=True,
+                )
+        except checkpoints.CheckpointBusy:
+            print(
+                f"assignment {assignment['assignment_id']} is already running on this "
+                "machine; refusing to start a duplicate model session"
+            )
+            return "busy"
     hash_match = check_task_content_hash(assignment, tasks_root)
     work_dir = HOME / "work"
     print("running trial (this can take a while)...")
@@ -769,6 +789,7 @@ def _resume_one_checkpoint(
             outcome = _run_and_submit(
                 client, resumed, tasks_root, args, local_commit,
                 telemetry=telemetry, resume_checkpoint=item,
+                _assignment_lock_held=True,
             )
             if telemetry:
                 telemetry.set_phase("queued")
@@ -1414,7 +1435,10 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
     try:
         active = _setup_refill(args, client, active, free_pick)
     except refill_plan.RefillError as exc:
-        refill_plan.stop(HOME, str(exc))
+        # Setup validation belongs to this invocation.  It must never mutate
+        # an already-active shared plan owned by other parallel workers.  The
+        # setup helper itself persists a stopped plan when *its own* initial
+        # refill has partially configured and then failed.
         print(f"continuous refill not started: {exc}")
         args.refill = False
     if not active:
