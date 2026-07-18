@@ -24,7 +24,7 @@ from .identity import cmd_link_github, cmd_login, cmd_rename, cmd_status
 from .leases import cmd_leases, cmd_release
 from .runloop import (
     cmd_checkpoint_discard, cmd_checkpoints, cmd_cleanup, cmd_go,
-    cmd_retry_upload,
+    cmd_refill_status, cmd_refill_stop, cmd_retry_upload,
 )
 
 __all__ = ["main"]
@@ -94,6 +94,13 @@ def main(argv: list[str] | None = None) -> int:
     p_cleanup.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
     p_cleanup.set_defaults(func=cmd_cleanup)
 
+    p_refill = sub.add_parser("refill", help="inspect or stop continuous auto-refill")
+    refill_sub = p_refill.add_subparsers(dest="refill_command", required=True)
+    p_refill_status = refill_sub.add_parser("status", help="show the local refill plan")
+    p_refill_status.set_defaults(func=cmd_refill_status)
+    p_refill_stop = refill_sub.add_parser("stop", help="stop claiming new refill tasks")
+    p_refill_stop.set_defaults(func=cmd_refill_stop)
+
     p_cp_list = sub.add_parser(
         "checkpoints", help="list resumable local checkpoints and their disk usage")
     p_cp_list.set_defaults(func=cmd_checkpoints)
@@ -122,6 +129,26 @@ def main(argv: list[str] | None = None) -> int:
             help="allow a second dradar on this machine (implies -y): sessions "
                  "split the held cells via server-side checkout, but they still "
                  "share this machine's CPU/RAM — expect slower individual runs",
+        )
+        p.add_argument(
+            "--refill", action="store_true",
+            help="keep replenishing the held queue (requires --max-tasks)",
+        )
+        p.add_argument(
+            "--refill-to", type=int, metavar="N",
+            help="target number of held/running tasks while refill is active",
+        )
+        p.add_argument(
+            "--max-tasks", type=int, metavar="N",
+            help="hard cap on all tasks reserved by this refill plan",
+        )
+        p.add_argument(
+            "--max-estimated-quota-pct", type=float, metavar="PCT",
+            help="optional estimated 7-day quota cap for the selected tier",
+        )
+        p.add_argument(
+            "--quota-tier", choices=("plus", "pro-5x", "pro-20x"), default="plus",
+            help="subscription tier used by --max-estimated-quota-pct (default: plus)",
         )
         if name == "go":
             # Free-pick instances normally require a prior web claim; these let
