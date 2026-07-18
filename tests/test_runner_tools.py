@@ -1,3 +1,5 @@
+import tomllib
+
 import dradar.runner as runner_mod
 from dradar.runner import CLAUDE_DISALLOWED_TOOLS, build_pier_command
 
@@ -13,7 +15,7 @@ def _stub_pier(monkeypatch):
     monkeypatch.setattr(runner_mod.shutil, "which", lambda _: "/usr/bin/pier")
 
 
-def test_codex_disables_web_search(tmp_path, monkeypatch):
+def test_codex_disables_server_side_network_tools(tmp_path, monkeypatch):
     _stub_pier(monkeypatch)
     # make the local task path exist so build_pier_command doesn't bail
     task = tmp_path / "abs-module-cache-flags"
@@ -28,6 +30,10 @@ def test_codex_disables_web_search(tmp_path, monkeypatch):
     # TOML nests it and codex ignores it (verified: bool/nested = no effect).
     assert 'web_search = "disabled"' in allowlist
     assert allowlist.index("web_search") < allowlist.index("[__pier_allowlist]")
+    config = tomllib.loads(allowlist)
+    assert config["web_search"] == "disabled"
+    assert config["features"]["apps"] is False
+    assert config["__pier_allowlist"] == {"url": "https://chatgpt.com"}
 
 
 def test_codex_prompt_requires_submission_artifact(tmp_path, monkeypatch):
