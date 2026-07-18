@@ -23,14 +23,20 @@ from .manifest import task_content_hash
 
 # The egress allowlist alone does NOT stop the agent from searching the web:
 # codex/Claude web tools execute server-side (at OpenAI/Anthropic), riding the
-# same allowed API channel. So we also disable the web tool at the agent-config
-# layer. Codex's key is a TOP-LEVEL string `web_search = "disabled"` (verified
+# same allowed API channel. So we also disable server-side tools at the
+# agent-config layer. Codex's key is a TOP-LEVEL string
+# `web_search = "disabled"` (verified
 # behaviourally: with it, codex makes zero web_search calls and reports no web
 # tool). It MUST come before any [table] header or TOML nests it into that
 # table; pier appends this block first into an otherwise-empty config.toml.
+# Apps/connectors have the same server-side property and can otherwise reach
+# services such as GitHub despite the task container's network policy, so the
+# stable `features.apps = false` switch must stay disabled as well.
 # Server-side trajectory audit is the backstop if a client tampers with this.
 ALLOWLIST_TOML = (
     'web_search = "disabled"\n'
+    '[features]\n'
+    'apps = false\n'
     '[__pier_allowlist]\n'
     'url = "https://chatgpt.com"\n'
 )
