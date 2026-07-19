@@ -35,6 +35,12 @@ from .scrub import scan_secrets, scrub_bytes, scrub_file
 from .telemetry import RunnerTelemetry
 
 
+# Quota is the user-facing campaign limit. Keep a deliberately high internal
+# count ceiling as a last-resort guard against corrupt estimates or a logic
+# regression; normal quota-bounded plans should never reach it.
+DEFAULT_REFILL_TASK_SAFETY_CAP = 1000
+
+
 def _fmt_pct(pct: float) -> str:
     """Adaptive precision, mirroring the radar page's price tags exactly so
     the CLI and the cell a volunteer just clicked always show the same
@@ -1124,8 +1130,13 @@ def cmd_go(args) -> int:
     if getattr(args, "refill", False):
         if getattr(args, "assignment", None):
             sys.exit("continuous refill cannot be combined with --assignment")
-        if args.max_tasks is None or args.max_tasks < 1:
-            sys.exit("--refill requires --max-tasks N (N >= 1)")
+        if args.max_tasks is None and args.max_estimated_quota_pct is None:
+            sys.exit("--refill requires --max-estimated-quota-pct PCT "
+                     "(or the advanced --max-tasks N limit)")
+        if args.max_tasks is None:
+            args.max_tasks = DEFAULT_REFILL_TASK_SAFETY_CAP
+        elif args.max_tasks < 1:
+            sys.exit("--max-tasks N requires N >= 1")
         if args.refill_to is not None and args.refill_to < 1:
             sys.exit("--refill-to N requires N >= 1")
         if (args.max_estimated_quota_pct is not None
@@ -1552,15 +1563,16 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
             return active
         args.refill = True
         args.refill_to = _prompt_positive_int("held queue target", len(active))
-        args.max_tasks = _prompt_positive_int(
-            "maximum tasks for this refill plan", max(len(active) * 2, len(active) + 1))
+        args.max_tasks = DEFAULT_REFILL_TASK_SAFETY_CAP
         tier = input("quota tier [plus/pro-5x/pro-20x] [plus]: ").strip().lower()
         args.quota_tier = tier or "plus"
-        quota = input("estimated 7-day quota cap in percent (blank for task cap only): ").strip()
+        quota = input("estimated 7-day quota cap in percent (required): ").strip()
         try:
-            args.max_estimated_quota_pct = float(quota) if quota else None
+            args.max_estimated_quota_pct = float(quota)
         except ValueError as exc:
-            raise refill_plan.RefillError("estimated quota cap must be a number") from exc
+            raise refill_plan.RefillError(
+                "estimated quota cap is required and must be a number"
+            ) from exc
         explicit = True
     if not explicit:
         return active
@@ -1596,7 +1608,7 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
     print("continuous refill plan:")
     print(f"  held queue target: {target} (server claim limit {me['claim_limit']})")
     print(f"  server concurrent limit: {me['concurrent_limit']}")
-    print(f"  hard task cap: {args.max_tasks}")
+    print(f"  internal task safety cap: {args.max_tasks}")
     if args.max_estimated_quota_pct is not None:
         print(f"  estimated quota cap: {args.max_estimated_quota_pct}% {args.quota_tier}")
     print("  safety: any non-submitted task stops refill; existing work is never released")

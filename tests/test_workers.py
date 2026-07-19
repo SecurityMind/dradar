@@ -42,6 +42,24 @@ def test_internal_worker_mode_cannot_be_used_as_a_normal_go():
         runloop.cmd_go(_args(workers=1, worker_child=True))
 
 
+def test_quota_only_refill_gets_an_internal_task_safety_cap(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        runloop, "_run_worker_pool",
+        lambda args: seen.append(args.max_tasks) or 0,
+    )
+    args = _args(
+        refill=True, max_tasks=None, max_estimated_quota_pct=12.5,
+    )
+    assert runloop.cmd_go(args) == 0
+    assert seen == [runloop.DEFAULT_REFILL_TASK_SAFETY_CAP]
+
+
+def test_refill_without_any_limit_is_rejected_before_setup():
+    with pytest.raises(SystemExit, match="requires --max-estimated-quota-pct"):
+        runloop.cmd_go(_args(refill=True))
+
+
 def test_worker_command_never_forwards_auto_selection():
     command = runloop._worker_command(_args())
     assert command[3:6] == ["resume", "-y", "--parallel"]
