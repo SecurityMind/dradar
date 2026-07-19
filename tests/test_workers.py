@@ -26,6 +26,13 @@ def test_cli_parses_workers_for_go(monkeypatch):
     assert seen[0].auto == 5
 
 
+def test_cli_accepts_auto_workers(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cli, "cmd_go", lambda args: seen.append(args) or 0)
+    assert cli.main(["resume", "--workers", "auto", "-y"]) == 0
+    assert seen[0].workers == "auto"
+
+
 @pytest.mark.parametrize("workers", [0, 33])
 def test_worker_count_is_bounded_before_any_setup(workers):
     with pytest.raises(SystemExit, match="1 <= N <= 32"):
@@ -115,6 +122,28 @@ def _patch_pool_setup(monkeypatch, active_count=5):
         runloop, "_prepare_batch",
         lambda _args, _client: ([{"assignment_id": str(i)} for i in range(active_count)], True),
     )
+
+
+def test_auto_workers_use_capacity_recommendation(monkeypatch, capsys):
+    _patch_pool_setup(monkeypatch, active_count=5)
+    from dradar.capacity import CapacityReport
+
+    report = CapacityReport(
+        recommended_workers=2, docker_cpus=8, docker_memory_gib=16,
+        disk_free_gib=100, account_limit=5, held_tasks=5, task_limit=5,
+        cpu_limit=4, memory_limit=2, disk_limit=7,
+    )
+    monkeypatch.setattr("dradar.capacity.inspect_capacity", lambda *_a, **_k: report)
+    monkeypatch.setattr("dradar.capacity.print_report", lambda r: print(f"auto={r.recommended_workers}"))
+    calls = []
+    monkeypatch.setattr(
+        runloop.subprocess, "Popen",
+        lambda command, env, **kwargs: calls.append(_Process(command, env, **kwargs)) or calls[-1],
+    )
+
+    assert runloop._run_worker_pool(_args(workers="auto")) == 0
+    assert len(calls) == 2
+    assert "auto=2" in capsys.readouterr().out
 
 
 def test_pool_prepares_once_then_starts_requested_resume_workers(monkeypatch):

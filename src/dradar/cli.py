@@ -19,6 +19,7 @@ import argparse
 import sys
 
 from . import __version__
+from .capacity import cmd_capacity
 from .doctor import cmd_doctor
 from .identity import cmd_link_github, cmd_login, cmd_rename, cmd_status
 from .leases import cmd_leases, cmd_release
@@ -28,6 +29,15 @@ from .runloop import (
 )
 
 __all__ = ["main"]
+
+
+def _workers_value(value: str) -> int | str:
+    if value.lower() == "auto":
+        return "auto"
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer or 'auto'") from exc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -49,6 +59,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p_doc = sub.add_parser("doctor", help="preflight checks")
     p_doc.set_defaults(func=cmd_doctor)
+
+    p_capacity = sub.add_parser(
+        "capacity", help="recommend a safe local worker count from Docker resources")
+    p_capacity.set_defaults(func=cmd_capacity)
 
     p_ren = sub.add_parser("rename", help="change your leaderboard name (points stay)")
     p_ren.add_argument("nickname")
@@ -131,9 +145,9 @@ def main(argv: list[str] | None = None) -> int:
                  "share this machine's CPU/RAM — expect slower individual runs",
         )
         p.add_argument(
-            "--workers", type=int, default=1, metavar="N",
-            help="run up to N tasks concurrently from this one command "
-                 "(default: 1; maximum: 32)",
+            "--workers", type=_workers_value, default=1, metavar="N|auto",
+            help="run up to N tasks concurrently, or use 'auto' for a "
+                 "conservative Docker-based recommendation (default: 1; maximum: 32)",
         )
         p.add_argument("--worker-child", action="store_true", help=argparse.SUPPRESS)
         p.add_argument(
