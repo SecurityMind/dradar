@@ -10,6 +10,7 @@ someone else with nothing counted. Split out of cli.py to separate this from
 identity (login/register) and doctor (environment checks) concerns.
 """
 
+import json
 import os
 import shutil
 import sys
@@ -289,9 +290,11 @@ def _upload_trial(
             HOME, assignment_id, keep_job_dir=keep_dir,
         )
 
-    def discard_unusable_checkpoint() -> None:
+    def discard_unusable_checkpoint(*, preserve_local: bool = False) -> None:
         item = checkpoints.find_latest(HOME, assignment_id)
         if item is None:
+            if preserve_local and job_dir and job_dir.is_dir():
+                (job_dir / checkpoints.KEEP_MARKER).touch(mode=0o600, exist_ok=True)
             return
         _discard_checkpoint_quietly(
             client, item,
@@ -299,6 +302,7 @@ def _upload_trial(
                 "resume_generation", item.resume_generation),
              "checkpoint_id": item.checkpoint_id},
             reason="invalid",
+            preserve_local=preserve_local,
         )
 
     patch, trajectory, result = trial_artifact_paths(Path(entry["trial_dir"]))
@@ -324,6 +328,14 @@ def _upload_trial(
         if trajectory:
             traj_scrubbed = scrubbed / "trajectory.json"
             scrub_file(trajectory, traj_scrubbed)
+            try:
+                value = json.loads(traj_scrubbed.read_bytes())
+                if not isinstance(value, dict):
+                    raise ValueError("top level is not an object")
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                print(f"  {task_id}: Pier produced a malformed optional trajectory "
+                      f"({exc}); uploading the verified result without it")
+                traj_scrubbed = None
         result_scrubbed = None
         if result:
             result_scrubbed = scrubbed / "result.json"
@@ -362,7 +374,8 @@ def _upload_trial(
                       "retrying can't fix it, dropping it from the retry queue "
                       f"(local artifact path: {patch.parent.parent})")
                 pending.remove(HOME, assignment_id)
-                discard_unusable_checkpoint()
+                discard_unusable_checkpoint(preserve_local=True)
+                print(f"  rejected artifacts kept for diagnosis: {patch.parent.parent}")
                 return "rejected"
             print(f"  {task_id}: upload failed ({exc}) — kept for retry "
                   "(`dradar retry-upload`)")
@@ -420,8 +433,9 @@ def _discard_checkpoint_quietly(
     assignment: dict | None = None,
     *,
     reason: str,
+    preserve_local: bool = False,
 ) -> bool:
-    """Invalidate server state first, then remove all local copies."""
+    """Invalidate server state, optionally preserving its local evidence."""
     assignment_id = item.assignment_id
     if not assignment_id:
         return False
@@ -450,7 +464,10 @@ def _discard_checkpoint_quietly(
         if exc.status_code not in (404, 409, 410):
             print(f"  couldn't discard checkpoint {item.checkpoint_id or '?'}: {exc}; kept locally")
             return False
-    checkpoints.cleanup_assignment(HOME, assignment_id)
+    if preserve_local:
+        checkpoints.mark_kept(HOME, item)
+    else:
+        checkpoints.cleanup_assignment(HOME, assignment_id)
     return True
 
 
