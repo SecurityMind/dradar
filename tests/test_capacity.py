@@ -84,11 +84,32 @@ def test_capacity_command_prints_machine_and_account_summary(monkeypatch, capsys
         disk_free_gib=100, account_limit=5, held_tasks=3, task_limit=3,
         cpu_limit=4, memory_limit=2, disk_limit=7,
     )
-    monkeypatch.setattr(capacity, "inspect_capacity", lambda _client: report)
+    monkeypatch.setattr(capacity, "inspect_capacity", lambda *_a, **_k: report)
     monkeypatch.setattr("dradar.identity._client", lambda _cfg: object())
     monkeypatch.setattr("dradar.local_config._load_config", lambda: {})
 
     assert capacity.cmd_capacity(object()) == 0
     out = capsys.readouterr().out
     assert "8 CPU / 16.0 GiB" in out
+    assert "CPU: 4 worker(s)" in out
+    assert "memory: 2 worker(s)" in out
+    assert "limiting constraint(s): memory" in out
     assert "recommended workers: 2" in out
+
+
+def test_standalone_capacity_is_not_limited_by_one_held_task(monkeypatch):
+    seen = []
+    report = capacity.CapacityReport(
+        recommended_workers=3, docker_cpus=12, docker_memory_gib=24,
+        disk_free_gib=100, account_limit=5, held_tasks=1, task_limit=4,
+        cpu_limit=6, memory_limit=3, disk_limit=7,
+    )
+    monkeypatch.setattr(
+        capacity, "inspect_capacity",
+        lambda _client, requested_tasks=None: seen.append(requested_tasks) or report,
+    )
+    monkeypatch.setattr("dradar.identity._client", lambda _cfg: object())
+    monkeypatch.setattr("dradar.local_config._load_config", lambda: {})
+
+    assert capacity.cmd_capacity(object()) == 0
+    assert seen == [capacity.AUTO_WORKER_CAP]

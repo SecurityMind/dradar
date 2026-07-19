@@ -117,8 +117,33 @@ def print_report(report: CapacityReport) -> None:
     print(f"  disk free: {report.disk_free_gib:.0f} GiB")
     print(f"  account concurrency limit: {report.account_limit}")
     print(f"  currently held tasks: {report.held_tasks}")
+    print("  safe ceilings by constraint:")
+    print(f"    CPU: {report.cpu_limit} worker(s) "
+          f"({CPU_PER_WORKER} CPU reserved per worker)")
+    print(f"    memory: {report.memory_limit} worker(s) "
+          f"({MEM_GIB_PER_WORKER} GiB per worker + "
+          f"{DOCKER_MEM_RESERVE_GIB} GiB Docker reserve)")
+    print(f"    disk: {report.disk_limit} worker(s) "
+          f"({FIRST_WORKER_DISK_GIB} GiB first-worker reserve, "
+          f"{EXTRA_WORKER_DISK_GIB} GiB each extra)")
+    print(f"    account: {report.account_limit} worker(s)")
+    print(f"    requested task capacity: {report.task_limit} worker(s)")
+    print(f"    automatic safety cap: {AUTO_WORKER_CAP} worker(s)")
     for warning in report.warnings:
         print(f"  warning: {warning}")
+    limits = {
+        "CPU": report.cpu_limit,
+        "memory": report.memory_limit,
+        "disk": report.disk_limit,
+        "account": report.account_limit,
+        "requested tasks": report.task_limit,
+        "automatic safety cap": AUTO_WORKER_CAP,
+    }
+    bottlenecks = ", ".join(
+        name for name, limit in limits.items()
+        if limit == report.recommended_workers
+    )
+    print(f"  limiting constraint(s): {bottlenecks}")
     print(f"recommended workers: {report.recommended_workers} "
           "(conservative; each task can spike during builds)")
 
@@ -131,7 +156,11 @@ def cmd_capacity(args) -> int:
     from .local_config import _load_config
 
     try:
-        report = inspect_capacity(_client(_load_config()))
+        # The standalone command answers "what can this machine safely run if
+        # refill supplies work?", not merely "how many of today's held cells
+        # exist?".  The actual resume path still clamps to its real task target.
+        report = inspect_capacity(
+            _client(_load_config()), requested_tasks=AUTO_WORKER_CAP)
     except ApiError as exc:
         raise SystemExit(f"capacity check failed: {exc}") from exc
     print_report(report)
