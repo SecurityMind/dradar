@@ -175,6 +175,40 @@ def test_upload_replaces_pier_cost_with_complete_multi_agent_sum(
     assert outcome == "submitted"
 
 
+def test_upload_omits_bundle_when_redaction_breaks_its_json(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    (trial_dir / "result.json").write_text(json.dumps({"agent_result": {
+        "cost_usd": 1.23, "n_input_tokens": 50}}))
+    sessions = trial_dir / "agent" / "sessions"
+    _write_codex_session(sessions / "root.jsonl", "root-1", "user",
+                         100, 60, 10)
+    _write_codex_session(sessions / "child.jsonl", "child-1", "subagent",
+                         50, 20, 5, parent="root-1")
+    monkeypatch.setattr(runloop, "scrub_bytes",
+                        lambda _data: b'{"broken":"bad\\q"}')
+
+    class CaptureClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            assert trajectory_bundle is None
+            assert meta["usage_aggregation_complete"] is True
+            agent = json.loads(result.read_text())["agent_result"]
+            assert agent["cost_usd"] is None
+            assert agent["n_input_tokens"] == 150
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    outcome = runloop._upload_trial(
+        CaptureClient(lambda _aid: None),
+        _entry(trial_dir, meta={"cost_usd": 1.23}),
+    )
+    assert outcome == "submitted"
+    assert "malformed optional trajectory bundle" in capsys.readouterr().out
+
+
 def test_upload_leaves_single_session_cost_and_metadata_unchanged(
     tmp_path: Path, monkeypatch,
 ):
