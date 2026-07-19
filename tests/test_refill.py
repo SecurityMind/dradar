@@ -121,6 +121,21 @@ def test_estimated_quota_cap_prevents_an_expensive_refill(tmp_path: Path):
     assert client.claimed == []
 
 
+def test_missing_pro_tier_conversion_stops_with_explicit_reason(tmp_path: Path):
+    client = RefillClient([])
+    _configure(
+        tmp_path, [], refill_to=2, max_tasks=5,
+        quota_tier="pro-20x", max_estimated_quota_pct=5.0,
+    )
+
+    result = refill.refill_once(tmp_path, client)
+
+    assert result["claimed"] == 0
+    assert result["status"] == "stopped"
+    assert "lack pro-20x quota conversion data" in result["reason"]
+    assert client.claimed == []
+
+
 def test_parallel_workers_share_one_atomic_refill_target(tmp_path: Path):
     client = RefillClient([])
     _configure(tmp_path, [], refill_to=5, max_tasks=10)

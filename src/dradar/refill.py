@@ -292,6 +292,7 @@ def refill_once(home: Path, client) -> dict:
         # request to the account's claim limit.
         suggestions = client.suggest(max(wanted, wanted * 3)).get("cells") or []
         quota_blocked = False
+        missing_quota_estimate = False
         for cell in suggestions:
             if claimed >= wanted:
                 break
@@ -299,7 +300,7 @@ def refill_once(home: Path, client) -> dict:
                 cell, plan["quota_tier"], plan.get("tier_windows_usd"))
             if quota_cap is not None:
                 if estimate is None:
-                    quota_blocked = True
+                    missing_quota_estimate = True
                     continue
                 if _reserved_quota(plan) + estimate > float(quota_cap) + 1e-9:
                     quota_blocked = True
@@ -316,7 +317,16 @@ def refill_once(home: Path, client) -> dict:
                 claimed += 1
                 _save_unlocked(home, plan)  # crash-safe after every accepted claim
 
-        if claimed == 0 and quota_blocked:
+        if claimed == 0 and missing_quota_estimate:
+            # This is a server/client data-contract failure, not an exhausted
+            # user quota.  Fail closed and say why instead of silently entering
+            # a misleading draining state that can never recover by itself.
+            plan["status"] = "stopped"
+            plan["stop_reason"] = (
+                f"recommendations lack {plan['quota_tier']} quota conversion data; "
+                "refill stopped before claiming work"
+            )
+        elif claimed == 0 and quota_blocked:
             plan["status"] = "draining"
             plan["stop_reason"] = "no recommended task fits the estimated quota left"
         _save_unlocked(home, plan)
