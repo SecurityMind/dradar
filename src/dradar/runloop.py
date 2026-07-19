@@ -1107,7 +1107,8 @@ def cmd_go(args) -> int:
     if getattr(args, "auto", None) is not None and args.auto < 1:
         sys.exit("--auto N requires N >= 1")
     workers = getattr(args, "workers", 1)
-    if workers < 1 or workers > 32:
+    auto_workers = workers == "auto"
+    if not auto_workers and (workers < 1 or workers > 32):
         sys.exit("--workers N requires 1 <= N <= 32")
     if getattr(args, "worker_child", False) and (
         workers != 1
@@ -1115,9 +1116,9 @@ def cmd_go(args) -> int:
         or not getattr(args, "resume", False)
     ):
         sys.exit("invalid internal worker invocation")
-    if workers > 1 and getattr(args, "parallel", False):
+    if (auto_workers or workers > 1) and getattr(args, "parallel", False):
         sys.exit("--workers already manages parallel sessions; do not combine it with --parallel")
-    if workers > 1 and getattr(args, "assignment", None):
+    if (auto_workers or workers > 1) and getattr(args, "assignment", None):
         sys.exit("--assignment targets one checkpoint and requires --workers 1")
     if getattr(args, "refill_to", None) is not None:
         args.refill = True
@@ -1142,7 +1143,7 @@ def cmd_go(args) -> int:
         if (args.max_estimated_quota_pct is not None
                 and args.max_estimated_quota_pct <= 0):
             sys.exit("--max-estimated-quota-pct must be greater than 0")
-    if workers > 1 and not getattr(args, "worker_child", False):
+    if (auto_workers or workers > 1) and not getattr(args, "worker_child", False):
         return _run_worker_pool(args)
     cfg = _load_config()
     client = _client(cfg, auto_register=True)
@@ -1271,6 +1272,19 @@ def _signal_workers(processes: list[subprocess.Popen]) -> None:
 
 def _run_worker_pool(args) -> int:
     """Prepare one batch, then supervise several ordinary resume processes."""
+    cfg = client = None
+    if args.workers == "auto":
+        from .capacity import inspect_capacity, print_report
+
+        cfg = _load_config()
+        client = _client(cfg, auto_register=True)
+        requested = getattr(args, "refill_to", None) or getattr(args, "auto", None)
+        try:
+            report = inspect_capacity(client, requested_tasks=requested)
+        except ApiError as exc:
+            _exit_for(exc)
+        print_report(report)
+        args.workers = report.recommended_workers
     if not args.yes:
         answer = input(
             f"start {args.workers} local workers? They share this machine's "
@@ -1281,8 +1295,9 @@ def _run_worker_pool(args) -> int:
             return 1
     args.yes = True
 
-    cfg = _load_config()
-    client = _client(cfg, auto_register=True)
+    if cfg is None or client is None:
+        cfg = _load_config()
+        client = _client(cfg, auto_register=True)
     tasks_root = tasks_root_from_config(cfg)
     acquire_run_lock(HOME)
     sweep_orphan_compose(True)
