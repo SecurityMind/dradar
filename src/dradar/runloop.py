@@ -1675,7 +1675,14 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
         quota_tier=args.quota_tier,
         max_estimated_quota_pct=args.max_estimated_quota_pct,
         active=active,
+        # A normal parent owns the exclusive per-machine run lock here, so no
+        # live local campaign can be displaced. Manual --parallel sessions do
+        # not own that proof and must keep the fail-closed conflict behavior.
+        replace_existing=explicit and not getattr(args, "parallel", False),
     )
+    if plan.get("replaced_plan_id"):
+        print("replaced a stale earlier refill configuration with the "
+              "newly confirmed limits")
     args.yes = True  # the one campaign confirmation replaces per-task prompts
     try:
         result = refill_plan.refill_once(HOME, client)
