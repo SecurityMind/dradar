@@ -385,10 +385,16 @@ def _upload_trial(
                 trajectory_bundle, ensure_ascii=False, separators=(",", ":"),
             ).encode("utf-8")
             trajectory_bundle_scrubbed.write_bytes(scrub_bytes(serialized))
-            # Redaction must never turn a valid bundle into malformed JSON.
-            # Treat that as a local bug and retain the pending upload instead
-            # of sending bytes the server must permanently reject.
-            json.loads(trajectory_bundle_scrubbed.read_bytes())
+            try:
+                json.loads(trajectory_bundle_scrubbed.read_bytes())
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                # The bundle is optional display data.  A redaction bug must
+                # not strand an otherwise valid patch/result or make every
+                # later `go` retry the same broken local upload forever.
+                print(f"  {task_id}: redaction produced a malformed optional "
+                      f"trajectory bundle ({exc}); uploading the verified "
+                      "result without it")
+                trajectory_bundle_scrubbed = None
         traj_scrubbed = None
         if trajectory:
             traj_scrubbed = scrubbed / "trajectory.json"
