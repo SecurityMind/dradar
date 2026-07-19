@@ -3,6 +3,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 from dradar import refill, runloop
 
 
@@ -152,6 +154,29 @@ def test_stopped_plan_never_claims_again(tmp_path: Path):
     refill.stop(tmp_path, "test stop")
     assert refill.refill_once(tmp_path, client)["claimed"] == 0
     assert client.claimed == []
+    assert refill.load(tmp_path) is None
+
+
+def test_mismatched_plan_requires_explicit_safe_replacement(tmp_path: Path):
+    active = [_assignment("a1")]
+    old = _configure(
+        tmp_path, active, refill_to=1, max_tasks=5,
+        max_estimated_quota_pct=2,
+    )
+    values = dict(
+        volunteer_id="v1", refill_to=2, max_tasks=5, quota_tier="plus",
+        max_estimated_quota_pct=4, active=active,
+    )
+
+    with pytest.raises(refill.RefillError, match="different limits"):
+        refill.configure(tmp_path, **values)
+
+    new = refill.configure(tmp_path, **values, replace_existing=True)
+    assert new["plan_id"] != old["plan_id"]
+    assert new["replaced_plan_id"] == old["plan_id"]
+    assert new["refill_to"] == 2
+    assert new["max_estimated_quota_pct"] == 4
+    assert set(new["assignments"]) == {"a1"}
 
 
 def test_web_added_tasks_cannot_silently_push_plan_past_hard_cap(tmp_path: Path):
@@ -176,6 +201,53 @@ def test_setup_clamps_target_to_server_claim_limit(tmp_path: Path, monkeypatch, 
     plan = refill.load(tmp_path)
     assert plan["refill_to"] == 3
     assert "using 3" in capsys.readouterr().out
+
+
+def test_normal_setup_replaces_stale_plan_before_refilling(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    active = [_assignment("a1")]
+    client = RefillClient(active)
+    old = _configure(
+        tmp_path, active, refill_to=1, max_tasks=5,
+        max_estimated_quota_pct=2,
+    )
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    args = argparse.Namespace(
+        refill=True, refill_to=2, auto=None, yes=True, max_tasks=5,
+        quota_tier="plus", max_estimated_quota_pct=4, parallel=False,
+    )
+
+    refreshed = runloop._setup_refill(args, client, active, True)
+
+    plan = refill.load(tmp_path)
+    assert len(refreshed) == 2
+    assert plan["plan_id"] != old["plan_id"]
+    assert plan["replaced_plan_id"] == old["plan_id"]
+    assert plan["max_estimated_quota_pct"] == 4
+    assert "replaced a stale earlier refill configuration" in capsys.readouterr().out
+
+
+def test_manual_parallel_setup_cannot_replace_another_plan(
+    tmp_path: Path, monkeypatch,
+):
+    active = [_assignment("a1")]
+    client = RefillClient(active)
+    old = _configure(
+        tmp_path, active, refill_to=1, max_tasks=5,
+        max_estimated_quota_pct=2,
+    )
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    args = argparse.Namespace(
+        refill=True, refill_to=2, auto=None, yes=True, max_tasks=5,
+        quota_tier="plus", max_estimated_quota_pct=4, parallel=True,
+    )
+
+    with pytest.raises(refill.RefillError, match="different limits"):
+        runloop._setup_refill(args, client, active, True)
+
+    assert refill.load(tmp_path)["plan_id"] == old["plan_id"]
+    assert client.claimed == []
 
 
 def test_interactive_refill_only_asks_user_for_quota_cap(
@@ -240,7 +312,7 @@ def test_non_submitted_outcome_stops_shared_plan(tmp_path: Path, monkeypatch):
     args = _args()
     args.refill = True
     assert runloop._run_checkout_loop(args, client, tmp_path, [assignment]) == 1
-    assert refill.load(tmp_path)["status"] == "stopped"
+    assert refill.load(tmp_path) is None
 
 
 def test_checkout_loop_refills_until_hard_cap_then_drains(
@@ -268,7 +340,7 @@ def test_checkout_loop_refills_until_hard_cap_then_drains(
     assert runloop._run_checkout_loop(args, client, tmp_path, [first]) == 0
     assert len(ran) == 3
     assert len(client.claimed) == 2
-    assert refill.load(tmp_path)["status"] == "completed"
+    assert refill.load(tmp_path) is None
 
 
 def test_two_workers_keep_draining_after_total_claim_cap(
@@ -324,4 +396,4 @@ def test_two_workers_keep_draining_after_total_claim_cap(
     assert len(set(completed)) == 5
     assert len(client.claimed) == 2
     assert client.active == []
-    assert refill.load(tmp_path)["status"] == "completed"
+    assert refill.load(tmp_path) is None

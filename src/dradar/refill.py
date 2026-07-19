@@ -152,6 +152,7 @@ def configure(
     quota_tier: str,
     max_estimated_quota_pct: float | None,
     active: list[dict],
+    replace_existing: bool = False,
 ) -> dict:
     if refill_to < 1 or max_tasks < 1 or max_tasks < len(active):
         raise RefillError("max tasks must be at least the currently held task count")
@@ -166,12 +167,16 @@ def configure(
     }
     with _locked(home):
         current = _load_unlocked(home)
+        replaced_plan_id = None
         if current and current.get("status") in RUNNING_STATES:
             if any(current.get(key) != value for key, value in desired.items()):
-                raise RefillError(
-                    "another refill plan is active with different limits; "
-                    "run `dradar refill stop` before starting a new one"
-                )
+                if not replace_existing:
+                    raise RefillError(
+                        "another refill plan is active with different limits"
+                    )
+                replaced_plan_id = current.get("plan_id")
+                current = None
+        if current and current.get("status") in RUNNING_STATES:
             plan = current
         else:
             plan = {
@@ -185,6 +190,8 @@ def configure(
                 "tier_windows_usd": None,
                 **desired,
             }
+            if replaced_plan_id:
+                plan["replaced_plan_id"] = replaced_plan_id
         for assignment in active:
             _reserve(plan, assignment)
         if len(plan["assignments"]) > max_tasks:
@@ -207,10 +214,12 @@ def stop(home: Path, reason: str = "user stopped") -> dict | None:
         plan = _load_unlocked(home)
         if not plan:
             return None
-        if plan.get("status") in RUNNING_STATES:
-            plan["status"] = "stopped"
-            plan["stop_reason"] = reason
-            _save_unlocked(home, plan)
+        plan["status"] = "stopped"
+        plan["stop_reason"] = reason
+        # A stopped plan has no recovery work left to coordinate. Keeping the
+        # file only exposes an internal implementation detail and previously
+        # let stale state confuse the next campaign.
+        _path(home).unlink(missing_ok=True)
         return plan
 
 
@@ -225,9 +234,7 @@ def complete_if_empty(home: Path, held: int) -> None:
     with _locked(home):
         plan = _load_unlocked(home)
         if plan and plan.get("status") in RUNNING_STATES:
-            plan["status"] = "completed"
-            plan["stop_reason"] = "queue drained"
-            _save_unlocked(home, plan)
+            _path(home).unlink(missing_ok=True)
 
 
 def refill_once(home: Path, client) -> dict:
