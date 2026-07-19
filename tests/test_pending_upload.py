@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from dradar import pending, runloop
+from dradar import checkpoints, pending, runloop
 from dradar.api_client import ApiError
 
 
@@ -80,6 +80,10 @@ class FakeClient:
         self.calls.append(assignment_id)
         return self.behavior(assignment_id)
 
+    def checkpoint_discard(self, assignment_id, checkpoint_id,
+                           resume_generation, reason):
+        self.discarded = (assignment_id, checkpoint_id, resume_generation, reason)
+
 
 def _make_trial_dir(tmp_path: Path, name: str = "t") -> Path:
     trial_dir = tmp_path / name
@@ -105,6 +109,27 @@ def test_upload_success_clears_ledger(tmp_path: Path, monkeypatch):
     outcome = runloop._upload_trial(client, _entry(trial_dir, meta={"k": "v"}))
     assert outcome == "submitted"
     assert pending.load(tmp_path) == []
+
+
+def test_upload_omits_malformed_optional_trajectory(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    (trial_dir / "agent").mkdir()
+    (trial_dir / "agent" / "trajectory.json").write_bytes(
+        b'{"agent":{},"steps":["bad\\q"]}'
+    )
+    (trial_dir / "result.json").write_text("{}")
+
+    class CaptureClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None):
+            assert trajectory is None
+            assert result is not None
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    outcome = runloop._upload_trial(CaptureClient(lambda _aid: None), _entry(trial_dir))
+    assert outcome == "submitted"
+    assert "malformed optional trajectory" in capsys.readouterr().out
 
 
 def test_upload_success_removes_current_and_superseded_checkpoint_jobs(
@@ -456,6 +481,31 @@ def test_definitively_rejected_upload_drops_ledger_entry(tmp_path: Path, monkeyp
     out = capsys.readouterr().out
     assert "retrying can't fix it" in out
     assert str(trial_dir) in out  # the local files are named, not vaporized
+
+
+def test_definitive_rejection_preserves_checkpoint_job(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    aid = "4" * 32
+    job = tmp_path / "work" / "jobs" / f"a{aid}"
+    trial = job / "task__one"
+    checkpoint = trial / "agent" / "checkpoint"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "checkpoint.json").write_text(json.dumps({
+        "schema_version": 1, "checkpoint_id": "checkpoint-rejected1",
+        "assignment_id": aid, "phase": "agent_completed",
+        "updated_at": "2026-07-19T01:00:00Z", "resume_generation": 0,
+    }))
+    (trial / "artifacts").mkdir()
+    (trial / "artifacts" / "model.patch").write_text("diff --git a b\n")
+    client = FakeClient(_raise(422))
+    outcome = runloop._upload_trial(
+        client,
+        _entry(trial, assignment_id=aid, job_dir=str(job), keep=False),
+    )
+    assert outcome == "rejected"
+    assert job.is_dir()
+    assert (job / checkpoints.KEEP_MARKER).is_file()
+    assert client.discarded[0] == aid
 
 
 def test_transient_5xx_keeps_ledger_entry(tmp_path: Path, monkeypatch):
