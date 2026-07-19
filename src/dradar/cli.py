@@ -131,6 +131,12 @@ def main(argv: list[str] | None = None) -> int:
                  "share this machine's CPU/RAM — expect slower individual runs",
         )
         p.add_argument(
+            "--workers", type=int, default=1, metavar="N",
+            help="run up to N tasks concurrently from this one command "
+                 "(default: 1; maximum: 32)",
+        )
+        p.add_argument("--worker-child", action="store_true", help=argparse.SUPPRESS)
+        p.add_argument(
             "--refill", action="store_true",
             help="keep replenishing the held queue (requires --max-tasks)",
         )

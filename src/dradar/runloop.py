@@ -12,9 +12,12 @@ identity (login/register) and doctor (environment checks) concerns.
 
 import json
 import os
+import signal
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from . import __version__, checkpoints, pending, refill as refill_plan
@@ -1097,6 +1100,19 @@ def cmd_go(args) -> int:
         sys.exit("--auto and --pick are two different ways to choose cells; pass only one")
     if getattr(args, "auto", None) is not None and args.auto < 1:
         sys.exit("--auto N requires N >= 1")
+    workers = getattr(args, "workers", 1)
+    if workers < 1 or workers > 32:
+        sys.exit("--workers N requires 1 <= N <= 32")
+    if getattr(args, "worker_child", False) and (
+        workers != 1
+        or not getattr(args, "parallel", False)
+        or not getattr(args, "resume", False)
+    ):
+        sys.exit("invalid internal worker invocation")
+    if workers > 1 and getattr(args, "parallel", False):
+        sys.exit("--workers already manages parallel sessions; do not combine it with --parallel")
+    if workers > 1 and getattr(args, "assignment", None):
+        sys.exit("--assignment targets one checkpoint and requires --workers 1")
     if getattr(args, "refill_to", None) is not None:
         args.refill = True
     refill_options = (
@@ -1115,6 +1131,8 @@ def cmd_go(args) -> int:
         if (args.max_estimated_quota_pct is not None
                 and args.max_estimated_quota_pct <= 0):
             sys.exit("--max-estimated-quota-pct must be greater than 0")
+    if workers > 1 and not getattr(args, "worker_child", False):
+        return _run_worker_pool(args)
     cfg = _load_config()
     client = _client(cfg, auto_register=True)
     # Pre-default configs may not carry tasks_root at all.  They now get the
@@ -1183,6 +1201,128 @@ def cmd_go(args) -> int:
         if getattr(args, "refill", False) and close_reason == "error":
             refill_plan.stop(HOME, "CLI exited unexpectedly")
         telemetry.close(close_reason)
+
+
+def _worker_command(args) -> list[str]:
+    """Build one internal resume worker without forwarding selection flags.
+
+    The supervisor is the only process allowed to auto-claim or configure a
+    refill plan. Children merely attach to that prepared batch and use the
+    server's atomic checkout endpoint, which prevents duplicate model runs.
+    """
+    command = [
+        sys.executable, "-m", "dradar.cli", "resume", "-y", "--parallel",
+        "--workers", "1", "--worker-child",
+    ]
+    if args.keep:
+        command.append("--keep")
+    if args.allow_task_drift:
+        command.append("--allow-task-drift")
+    if args.dev_agent:
+        command.extend(("--dev-agent", args.dev_agent))
+    if getattr(args, "refill", False):
+        command.extend(("--refill", "--max-tasks", str(args.max_tasks)))
+        if args.refill_to is not None:
+            command.extend(("--refill-to", str(args.refill_to)))
+        if args.max_estimated_quota_pct is not None:
+            command.extend((
+                "--max-estimated-quota-pct", str(args.max_estimated_quota_pct),
+            ))
+        command.extend(("--quota-tier", args.quota_tier))
+    return command
+
+
+def _signal_workers(processes: list[subprocess.Popen]) -> None:
+    """Ask children to stop cleanly, then bound escalation to dead processes."""
+    for process in processes:
+        if process.poll() is not None:
+            continue
+        try:
+            if os.name == "nt":
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                process.send_signal(signal.SIGINT)
+        except (OSError, ProcessLookupError):
+            pass
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and any(p.poll() is None for p in processes):
+        time.sleep(0.05)
+    for process in processes:
+        if process.poll() is None:
+            process.terminate()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and any(p.poll() is None for p in processes):
+        time.sleep(0.05)
+    for process in processes:
+        if process.poll() is None:
+            process.kill()
+
+
+def _run_worker_pool(args) -> int:
+    """Prepare one batch, then supervise several ordinary resume processes."""
+    if not args.yes:
+        answer = input(
+            f"start {args.workers} local workers? They share this machine's "
+            "CPU/RAM and may use model quota concurrently. [y/N] "
+        ).strip().lower()
+        if answer not in ("y", "yes"):
+            print("not started; no new tasks were claimed")
+            return 1
+    args.yes = True
+
+    cfg = _load_config()
+    client = _client(cfg, auto_register=True)
+    tasks_root = tasks_root_from_config(cfg)
+    acquire_run_lock(HOME)
+    sweep_orphan_compose(True)
+    try:
+        ensure_tasks_root(tasks_root)
+        ensure_pier()
+    except RunnerError as exc:
+        sys.exit(str(exc))
+    _retry_pending_uploads(client)
+
+    active, _free_pick = _prepare_batch(args, client)
+    if not active:
+        return 0
+    count = min(args.workers, len(active))
+    if count < args.workers:
+        print(f"only {len(active)} task(s) are currently held; starting {count} worker(s)")
+    print(f"starting {count} worker(s); server-side checkout assigns each task exactly once")
+    command = _worker_command(args)
+    popen_kwargs = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    processes: list[subprocess.Popen] = []
+    try:
+        for index in range(1, count + 1):
+            env = os.environ.copy()
+            env["DRADAR_WORKER_INDEX"] = str(index)
+            process = subprocess.Popen(command, env=env, **popen_kwargs)
+            processes.append(process)
+            print(f"  worker {index}/{count}: pid {process.pid}")
+        returncodes = [process.wait() for process in processes]
+    except (KeyboardInterrupt, EOFError):
+        print("\nstopping workers safely; active tasks remain resumable...")
+        _signal_workers(processes)
+        raise
+    except OSError as exc:
+        # A later spawn can fail after earlier children are already live
+        # (process limit, executable disappeared, Windows group setup, ...).
+        # Never orphan those children: an unobserved Pier run can keep using
+        # model quota even though the command appears to have failed.
+        print(f"couldn't start every worker ({exc}); stopping those already started")
+        _signal_workers(processes)
+        return 1
+    failed = [(i, rc) for i, rc in enumerate(returncodes, 1) if rc != 0]
+    if failed:
+        detail = ", ".join(f"worker {i}=exit {rc}" for i, rc in failed)
+        print(f"worker pool finished with errors: {detail}")
+        print("completed uploads are preserved; use `dradar leases`, `dradar checkpoints`, "
+              "and `dradar resume` for remaining work")
+        return 1
+    print("all workers finished")
+    return 0
 
 
 def _acquire_batch(client: ApiClient, yes: bool) -> tuple[list[dict], bool]:
@@ -1495,11 +1635,8 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
     return refreshed
 
 
-def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
-             telemetry: RunnerTelemetry | None = None) -> int:
-    """Run the volunteer's held batch of cells serially: acquire the batch
-    (web-claimed on free-pick instances, menu-claimed otherwise), explain an
-    empty one, hand a non-empty one to _run_batch."""
+def _prepare_batch(args, client: ApiClient) -> tuple[list[dict], bool]:
+    """Claim/configure once, shared by the serial and supervised run paths."""
     active, free_pick = _acquire_batch(client, args.yes)
     wants_pick = getattr(args, "pick", None)
     auto_target = getattr(args, "auto", None)
@@ -1529,15 +1666,20 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
             active = _claim_picks(client, args.pick)
         except ApiError as exc:
             _exit_for(exc)
-    try:
-        active = _setup_refill(args, client, active, free_pick)
-    except refill_plan.RefillError as exc:
-        # Setup validation belongs to this invocation.  It must never mutate
-        # an already-active shared plan owned by other parallel workers.  The
-        # setup helper itself persists a stopped plan when *its own* initial
-        # refill has partially configured and then failed.
-        print(f"continuous refill not started: {exc}")
-        args.refill = False
+    if getattr(args, "worker_child", False):
+        # The parent configured the shared plan before launching us. Rewriting
+        # it from every child would reset its counters and race its file lock.
+        if wants_refill and not refill_plan.is_running(HOME):
+            print("continuous refill plan is no longer active; draining held tasks only")
+            args.refill = False
+    else:
+        try:
+            active = _setup_refill(args, client, active, free_pick)
+        except refill_plan.RefillError as exc:
+            # Setup validation belongs to this invocation. It must never mutate
+            # an already-active shared plan owned by other parallel workers.
+            print(f"continuous refill not started: {exc}")
+            args.refill = False
     if not active:
         if free_pick and wants:
             print("nothing claimed — try again, or pick on the radar page instead.")
@@ -1549,6 +1691,15 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
             print("nothing to resume — no active lease (it may have expired). Run `dradar go`.")
         else:
             print("no work available right now — thank you, check back later")
+        return [], free_pick
+    return active, free_pick
+
+
+def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
+             telemetry: RunnerTelemetry | None = None) -> int:
+    """Prepare a held batch and run it through atomic checkout when possible."""
+    active, free_pick = _prepare_batch(args, client)
+    if not active:
         return 0
     if telemetry:
         telemetry.bind_batch(active[0].get("batch_id"))
