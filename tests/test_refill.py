@@ -163,6 +163,27 @@ def test_setup_clamps_target_to_server_claim_limit(tmp_path: Path, monkeypatch, 
     assert "using 3" in capsys.readouterr().out
 
 
+def test_interactive_refill_only_asks_user_for_quota_cap(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    client = RefillClient([_assignment("a1")])
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    answers = iter(("y", "", "", "5", "y"))
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    args = argparse.Namespace(
+        refill=False, refill_to=None, auto=None, yes=False, max_tasks=None,
+        quota_tier="plus", max_estimated_quota_pct=None,
+    )
+
+    active = runloop._setup_refill(args, client, client.active, True)
+
+    assert active == client.active
+    assert args.max_tasks == runloop.DEFAULT_REFILL_TASK_SAFETY_CAP
+    assert args.max_estimated_quota_pct == 5
+    out = capsys.readouterr().out
+    assert "internal task safety cap" in out
+
+
 def test_invalid_new_setup_cannot_stop_existing_shared_plan(
     tmp_path: Path, monkeypatch,
 ):

@@ -138,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--worker-child", action="store_true", help=argparse.SUPPRESS)
         p.add_argument(
             "--refill", action="store_true",
-            help="keep replenishing the held queue (requires --max-tasks)",
+            help="keep replenishing the held queue (requires a quota or task limit)",
         )
         p.add_argument(
             "--refill-to", type=int, metavar="N",
@@ -146,11 +146,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         p.add_argument(
             "--max-tasks", type=int, metavar="N",
-            help="hard cap on all tasks reserved by this refill plan",
+            help="optional advanced task-count cap for this refill plan",
         )
         p.add_argument(
             "--max-estimated-quota-pct", type=float, metavar="PCT",
-            help="optional estimated 7-day quota cap for the selected tier",
+            help="estimated 7-day quota cap for the selected tier",
         )
         p.add_argument(
             "--quota-tier", choices=("plus", "pro-5x", "pro-20x"), default="plus",
