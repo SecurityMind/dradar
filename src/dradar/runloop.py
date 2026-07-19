@@ -1143,6 +1143,8 @@ def cmd_go(args) -> int:
         if (args.max_estimated_quota_pct is not None
                 and args.max_estimated_quota_pct <= 0):
             sys.exit("--max-estimated-quota-pct must be greater than 0")
+    if not auto_workers:
+        _align_refill_target_with_workers(args)
     if (auto_workers or workers > 1) and not getattr(args, "worker_child", False):
         return _run_worker_pool(args)
     cfg = _load_config()
@@ -1274,17 +1276,26 @@ def _run_worker_pool(args) -> int:
     """Prepare one batch, then supervise several ordinary resume processes."""
     cfg = client = None
     if args.workers == "auto":
-        from .capacity import inspect_capacity, print_report
+        from .capacity import AUTO_WORKER_CAP, inspect_capacity, print_report
 
         cfg = _load_config()
         client = _client(cfg, auto_register=True)
-        requested = getattr(args, "refill_to", None) or getattr(args, "auto", None)
+        requested_options = [
+            value for value in (
+                getattr(args, "refill_to", None), getattr(args, "auto", None),
+                AUTO_WORKER_CAP if getattr(args, "refill", False) else None,
+            ) if value is not None
+        ]
+        requested = max(requested_options) if requested_options else None
+        if requested is not None and getattr(args, "max_tasks", None) is not None:
+            requested = min(requested, args.max_tasks)
         try:
             report = inspect_capacity(client, requested_tasks=requested)
         except ApiError as exc:
             _exit_for(exc)
         print_report(report)
         args.workers = report.recommended_workers
+        _align_refill_target_with_workers(args)
     if not args.yes:
         answer = input(
             f"start {args.workers} local workers? They share this machine's "
@@ -1349,6 +1360,28 @@ def _run_worker_pool(args) -> int:
         return 1
     print("all workers finished")
     return 0
+
+
+def _align_refill_target_with_workers(args) -> None:
+    """A refill queue smaller than its worker pool is accidental idling.
+
+    Raise only the queue target, never the user's task/quota ceilings.  If an
+    explicit max_tasks is lower than the requested worker count, that hard cap
+    wins and the pool naturally starts fewer children after the bounded top-up.
+    """
+    if not getattr(args, "refill", False):
+        return
+    workers = getattr(args, "workers", 1)
+    if not isinstance(workers, int) or workers <= 1:
+        return
+    floor = workers
+    if getattr(args, "max_tasks", None) is not None:
+        floor = min(floor, int(args.max_tasks))
+    current = getattr(args, "refill_to", None)
+    if current is None or current < floor:
+        args.refill_to = floor
+        print(f"refill queue target raised to {floor} so {workers} worker(s) can stay busy; "
+              "quota/task caps remain unchanged")
 
 
 def _acquire_batch(client: ApiClient, yes: bool) -> tuple[list[dict], bool]:

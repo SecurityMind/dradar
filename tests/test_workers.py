@@ -62,6 +62,21 @@ def test_quota_only_refill_gets_an_internal_task_safety_cap(monkeypatch):
     assert seen == [runloop.DEFAULT_REFILL_TASK_SAFETY_CAP]
 
 
+def test_manual_workers_raise_too_small_refill_queue(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        runloop, "_run_worker_pool",
+        lambda args: seen.append((args.workers, args.refill_to)) or 0,
+    )
+    args = _args(
+        workers=3, refill=True, refill_to=1, max_tasks=100,
+        max_estimated_quota_pct=5,
+    )
+
+    assert runloop.cmd_go(args) == 0
+    assert seen == [(3, 3)]
+
+
 def test_refill_without_any_limit_is_rejected_before_setup():
     with pytest.raises(SystemExit, match="requires --max-estimated-quota-pct"):
         runloop.cmd_go(_args(refill=True))
@@ -144,6 +159,47 @@ def test_auto_workers_use_capacity_recommendation(monkeypatch, capsys):
     assert runloop._run_worker_pool(_args(workers="auto")) == 0
     assert len(calls) == 2
     assert "auto=2" in capsys.readouterr().out
+
+
+def test_one_claim_auto_workers_refill_to_detected_concurrency(monkeypatch):
+    seen_refill_targets = []
+    _patch_pool_setup(monkeypatch, active_count=3)
+    monkeypatch.setattr(
+        runloop, "_prepare_batch",
+        lambda args, _client: (
+            seen_refill_targets.append(args.refill_to)
+            or ([{"assignment_id": str(i)} for i in range(3)], True)
+        ),
+    )
+    from dradar.capacity import CapacityReport
+
+    report = CapacityReport(
+        recommended_workers=3, docker_cpus=12, docker_memory_gib=24,
+        disk_free_gib=100, account_limit=5, held_tasks=1, task_limit=4,
+        cpu_limit=6, memory_limit=3, disk_limit=7,
+    )
+    monkeypatch.setattr("dradar.capacity.inspect_capacity", lambda *_a, **_k: report)
+    monkeypatch.setattr("dradar.capacity.print_report", lambda _report: None)
+    monkeypatch.setattr(
+        runloop.subprocess, "Popen",
+        lambda command, env, **kwargs: _Process(command, env, **kwargs),
+    )
+    args = _args(
+        workers="auto", refill=True, refill_to=1, max_tasks=100,
+        max_estimated_quota_pct=5,
+    )
+
+    assert runloop._run_worker_pool(args) == 0
+    assert seen_refill_targets == [3]
+    assert args.refill_to == 3
+
+
+def test_worker_floor_never_overrides_explicit_task_cap():
+    args = _args(workers=4, refill=True, refill_to=1, max_tasks=2)
+
+    runloop._align_refill_target_with_workers(args)
+
+    assert args.refill_to == 2
 
 
 def test_pool_prepares_once_then_starts_requested_resume_workers(monkeypatch):
