@@ -252,6 +252,7 @@ class ApiClient:
         client_meta: dict[str, Any],
         outcome: str = "completed",
         resume_generation: int | None = None,
+        trajectory_bundle: Path | None = None,
     ) -> dict[str, Any]:
         files: list[tuple[str, tuple[str, bytes]]] = [
             ("patch", ("model.patch", patch.read_bytes())),
@@ -260,6 +261,9 @@ class ApiClient:
             files.append(("trajectory", ("trajectory.json", trajectory.read_bytes())))
         if result and result.exists():
             files.append(("result", ("result.json", result.read_bytes())))
+        if trajectory_bundle and trajectory_bundle.exists():
+            files.append(("trajectory_bundle", (
+                "trajectory_bundle.json", trajectory_bundle.read_bytes())))
         data = {
             "assignment_id": assignment_id,
             "nonce": nonce,

@@ -23,11 +23,12 @@ from .identity import _client
 from .local_config import HOME, _load_config, tasks_root_from_config
 from .machine import acquire_run_lock, sweep_orphan_compose
 from .runner import (
-    DIAG_ADVICE, BuildFlakeError, RunnerError, check_task_content_hash,
+    DIAG_ADVICE, BuildFlakeError, RunnerError, build_codex_trajectory_bundle,
+    check_task_content_hash, codex_trajectory_bundle_usage,
     diagnose_exception, ensure_pier, ensure_tasks_root, local_deep_swe_commit,
     run_trial, summarize_result, sync_deep_swe_commit, trial_artifact_paths,
 )
-from .scrub import scan_secrets, scrub_file
+from .scrub import scan_secrets, scrub_bytes, scrub_file
 from .telemetry import RunnerTelemetry
 
 
@@ -256,6 +257,39 @@ def _check_version_pin(pinned: str | None, tasks_root: Path, allow_drift: bool) 
 _artifacts_from_trial_dir = trial_artifact_paths
 
 
+def _apply_codex_usage_to_result(result_path: Path, usage: dict) -> None:
+    """Replace Pier's arbitrary single-session totals in an upload copy.
+
+    The raw result remains untouched for retry/debugging.  Clearing cost_usd
+    is intentional: the server owns the model price table and recomputes the
+    cost from these normalized aggregate token counters.
+    """
+    try:
+        payload = json.loads(result_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    agent_result = payload.get("agent_result")
+    if not isinstance(agent_result, dict):
+        agent_result = {}
+        payload["agent_result"] = agent_result
+    agent_result["cost_usd"] = None
+    complete = bool(usage.get("complete"))
+    for result_key, usage_key in (
+        ("n_input_tokens", "n_input_tokens"),
+        ("n_cache_tokens", "n_cache_tokens"),
+        ("n_output_tokens", "n_output_tokens"),
+    ):
+        agent_result[result_key] = usage.get(usage_key) if complete else None
+    metadata = agent_result.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        agent_result["metadata"] = metadata
+    metadata["codex_session_usage"] = usage
+    result_path.write_text(json.dumps(payload, ensure_ascii=False))
+
+
 def _upload_trial(
     client: ApiClient, entry: dict, *, ask_cleanup: bool = False,
 ) -> str:
@@ -322,8 +356,39 @@ def _upload_trial(
         discard_unusable_checkpoint()
         return "not-uploaded"
 
+    trajectory_bundle = build_codex_trajectory_bundle(Path(entry["trial_dir"]))
+    usage = (codex_trajectory_bundle_usage(trajectory_bundle)
+             if trajectory_bundle is not None else None)
+    multi_session = bool(usage and (
+        usage.get("subagent_session_count", 0) > 0
+        or usage.get("agent_session_count", 0) > 1
+        or usage.get("session_file_count", 0) > 1
+    ))
+    upload_meta = dict(entry.get("meta") or {})
+    if multi_session:
+        upload_meta["cost_usd"] = None
+        upload_meta["usage_aggregation"] = usage["schema"]
+        upload_meta["usage_aggregation_complete"] = usage["complete"]
+        upload_meta["agent_session_count"] = usage["agent_session_count"]
+        upload_meta["root_session_count"] = usage["root_session_count"]
+        upload_meta["subagent_session_count"] = usage["subagent_session_count"]
+        upload_meta["agent_session_usage"] = usage["sessions"]
+        for key in ("n_input_tokens", "n_cache_tokens", "n_output_tokens"):
+            upload_meta[key] = usage[key] if usage["complete"] else None
+
     with tempfile.TemporaryDirectory() as td:
         scrubbed = Path(td)
+        trajectory_bundle_scrubbed = None
+        if multi_session:
+            trajectory_bundle_scrubbed = scrubbed / "trajectory_bundle.json"
+            serialized = json.dumps(
+                trajectory_bundle, ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+            trajectory_bundle_scrubbed.write_bytes(scrub_bytes(serialized))
+            # Redaction must never turn a valid bundle into malformed JSON.
+            # Treat that as a local bug and retain the pending upload instead
+            # of sending bytes the server must permanently reject.
+            json.loads(trajectory_bundle_scrubbed.read_bytes())
         traj_scrubbed = None
         if trajectory:
             traj_scrubbed = scrubbed / "trajectory.json"
@@ -340,14 +405,23 @@ def _upload_trial(
         if result:
             result_scrubbed = scrubbed / "result.json"
             scrub_file(result, result_scrubbed)
+            if multi_session:
+                _apply_codex_usage_to_result(result_scrubbed, usage)
         # Record before submitting: from here on an unacked completed trial
         # always has a ledger entry, whatever kills the upload. The server
         # dedupes replays (409 "already submitted"), so duplicates are safe.
         pending.record(HOME, entry)
         try:
-            ack = client.submit(assignment_id, entry["nonce"], patch, traj_scrubbed,
-                                result_scrubbed, entry["meta"], outcome=outcome,
-                                resume_generation=entry.get("resume_generation"))
+            submit_kwargs = {
+                "outcome": outcome,
+                "resume_generation": entry.get("resume_generation"),
+            }
+            if trajectory_bundle_scrubbed is not None:
+                submit_kwargs["trajectory_bundle"] = trajectory_bundle_scrubbed
+            ack = client.submit(
+                assignment_id, entry["nonce"], patch, traj_scrubbed,
+                result_scrubbed, upload_meta, **submit_kwargs,
+            )
         except ApiError as exc:
             if exc.status_code == 409 and "already submitted" in str(exc).lower():
                 # Some earlier attempt actually landed server-side even

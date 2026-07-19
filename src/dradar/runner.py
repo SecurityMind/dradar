@@ -290,6 +290,269 @@ def trial_artifact_paths(trial_dir: Path) -> tuple[Path, Path | None, Path | Non
     return patch, (trajectory if trajectory.is_file() else None), (result if result.is_file() else None)
 
 
+CODEX_TRAJECTORY_BUNDLE_SCHEMA = "dradar-codex-trajectory-bundle-v1"
+
+
+def _codex_usage(value) -> dict | None:
+    """Normalize one cumulative Codex token counter object."""
+    if not isinstance(value, dict):
+        return None
+    names = ("input_tokens", "cached_input_tokens", "output_tokens")
+    counters = {}
+    for name in names:
+        item = value.get(name)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            return None
+        counters[name] = item
+    if counters["cached_input_tokens"] > counters["input_tokens"]:
+        return None
+    reasoning = value.get("reasoning_output_tokens", 0)
+    if isinstance(reasoning, bool) or not isinstance(reasoning, int) or reasoning < 0:
+        reasoning = 0
+    counters["reasoning_output_tokens"] = reasoning
+    return counters
+
+
+def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
+    """Describe one Codex JSONL file and isolate this agent's own usage.
+
+    A spawned Codex agent currently receives a copy of its parent's event
+    prefix.  Consequently its final cumulative counters include the inherited
+    parent tokens.  Summing the final counters would overcharge just as badly
+    as Pier's single-file conversion undercharges.  The last ``task_started``
+    marks the spawned agent's own segment; subtract the final counter before
+    that boundary.
+    """
+    meta_events = [event for event in events if event.get("type") == "session_meta"]
+    first_meta = meta_events[0].get("payload", {}) if meta_events else {}
+    if not isinstance(first_meta, dict):
+        first_meta = {}
+    raw_id = first_meta.get("id") or first_meta.get("session_id")
+    session_id = raw_id if isinstance(raw_id, str) and raw_id else fallback_id
+    raw_role = first_meta.get("thread_source")
+    role = "root" if raw_role == "user" else (
+        "subagent" if raw_role == "subagent" else "unknown")
+    parent_session_id = None
+    source = first_meta.get("source") or {}
+    if isinstance(source, dict) and isinstance(source.get("subagent"), dict):
+        spawn = source["subagent"].get("thread_spawn")
+        if isinstance(spawn, dict):
+            raw_parent = spawn.get("parent_thread_id")
+            if isinstance(raw_parent, str) and raw_parent:
+                parent_session_id = raw_parent
+
+    starts = []
+    usage_events: list[tuple[int, dict]] = []
+    for index, event in enumerate(events):
+        payload = event.get("payload") or {}
+        if event.get("type") == "event_msg" and isinstance(payload, dict):
+            if payload.get("type") == "task_started":
+                starts.append(index)
+            elif payload.get("type") == "token_count":
+                info = payload.get("info") or {}
+                usage = _codex_usage(
+                    info.get("total_token_usage") if isinstance(info, dict) else None)
+                if usage is not None:
+                    usage_events.append((index, usage))
+
+    # Root files start at zero.  Child files containing an inherited prefix
+    # have multiple session_meta/task_started events; their last task_started
+    # is the beginning of the child's own work.
+    inherited_prefix = role == "subagent" and (
+        len(meta_events) > 1 or len(starts) > 1)
+    boundary = starts[-1] if starts else 0
+    baseline = {name: 0 for name in (
+        "input_tokens", "cached_input_tokens", "output_tokens",
+        "reasoning_output_tokens",
+    )}
+    baseline_found = not inherited_prefix
+    if inherited_prefix:
+        for index, usage in usage_events:
+            if index >= boundary:
+                break
+            baseline = usage
+            baseline_found = True
+
+    final_usage = usage_events[-1][1] if usage_events else None
+    final_after_boundary = bool(usage_events and usage_events[-1][0] >= boundary)
+    own_usage = None
+    if final_usage is not None and final_after_boundary and baseline_found:
+        candidate = {name: final_usage[name] - baseline[name] for name in baseline}
+        if (all(value >= 0 for value in candidate.values())
+                and candidate["cached_input_tokens"] <= candidate["input_tokens"]):
+            own_usage = candidate
+
+    model_name = None
+    for event in events[boundary:]:
+        if event.get("type") != "turn_context":
+            continue
+        payload = event.get("payload") or {}
+        model = payload.get("model") if isinstance(payload, dict) else None
+        if isinstance(model, str) and model:
+            model_name = model
+
+    return {
+        "session_id": session_id,
+        "role": role,
+        "parent_session_id": parent_session_id,
+        "model_name": model_name,
+        "inherited_usage": baseline if baseline_found else None,
+        "total_usage": final_usage,
+        "usage": own_usage,
+        "complete": (
+            role != "unknown" and model_name is not None and own_usage is not None
+        ),
+        "events": events,
+    }
+
+
+def build_codex_trajectory_bundle(trial_dir: Path) -> dict | None:
+    """Convert all Codex JSONL files into one versioned multi-agent bundle.
+
+    The bundle retains every parsed event and the root/subagent relationship.
+    It is scrubbed immediately before upload and scrubbed again by the server.
+    Malformed lines or missing identity/usage evidence make the bundle
+    incomplete; callers must suppress cost rather than report a partial sum.
+    """
+    sessions_dir = trial_dir / "agent" / "sessions"
+    if not sessions_dir.is_dir():
+        return None
+
+    files = sorted(sessions_dir.rglob("*.jsonl"))
+    if not files:
+        return None
+
+    sessions = []
+    parse_complete = True
+    for artifact_index, session_file in enumerate(files):
+        events = []
+        parse_error_count = 0
+        try:
+            handle = session_file.open(errors="replace")
+        except OSError:
+            parse_complete = False
+            record = _analyze_codex_session_events(
+                [], fallback_id=f"artifact:{artifact_index}")
+            record["artifact_index"] = artifact_index
+            record["parse_error_count"] = 1
+            record["complete"] = False
+            sessions.append(record)
+            continue
+        with handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    parse_error_count += 1
+                    continue
+                if not isinstance(event, dict):
+                    parse_error_count += 1
+                    continue
+                events.append(event)
+
+        record = _analyze_codex_session_events(
+            events, fallback_id=f"artifact:{artifact_index}")
+        record["artifact_index"] = artifact_index
+        record["parse_error_count"] = parse_error_count
+        if parse_error_count:
+            record["complete"] = False
+            parse_complete = False
+        sessions.append(record)
+
+    if not sessions:
+        return None
+
+    # A resumed run can leave multiple files for the same Codex session id.
+    # Retain every event stream in the bundle, but count the richest complete
+    # representative only once for billing.
+    representatives = {}
+    for item in sessions:
+        key = item["session_id"]
+        score = len(item["events"])
+        previous = representatives.get(key)
+        if previous is None or (item["complete"], score) > (
+                previous["complete"], len(previous["events"])):
+            representatives[key] = item
+
+    usage_sessions = []
+    for item in representatives.values():
+        usage = item.get("usage")
+        if usage is None:
+            continue
+        usage_sessions.append({
+            "session_id": item["session_id"],
+            "role": item["role"],
+            "parent_session_id": item["parent_session_id"],
+            "model_name": item["model_name"],
+            "n_input_tokens": usage["input_tokens"],
+            "n_cache_tokens": usage["cached_input_tokens"],
+            "n_output_tokens": usage["output_tokens"],
+            "n_reasoning_output_tokens": usage["reasoning_output_tokens"],
+        })
+    usage_sessions.sort(key=lambda item: (
+        item["role"] != "root", item["session_id"]))
+    root_count = sum(1 for item in representatives.values()
+                     if item["role"] == "root")
+    ids = set(representatives)
+    parent_graph_valid = True
+    for session_id, item in representatives.items():
+        if item["role"] != "subagent":
+            continue
+        parent = item["parent_session_id"]
+        seen = {session_id}
+        while parent is not None:
+            if parent in seen or parent not in ids:
+                parent_graph_valid = False
+                break
+            seen.add(parent)
+            parent = representatives[parent]["parent_session_id"]
+    complete = (
+        parse_complete
+        and all(item["complete"] for item in representatives.values())
+        and root_count == 1
+        and parent_graph_valid
+    )
+    aggregate = {
+        "n_input_tokens": sum(item["n_input_tokens"] for item in usage_sessions),
+        "n_cache_tokens": sum(item["n_cache_tokens"] for item in usage_sessions),
+        "n_output_tokens": sum(item["n_output_tokens"] for item in usage_sessions),
+        "n_reasoning_output_tokens": sum(
+            item["n_reasoning_output_tokens"] for item in usage_sessions),
+    }
+    return {
+        "schema_version": CODEX_TRAJECTORY_BUNDLE_SCHEMA,
+        "complete": complete,
+        "session_file_count": len(files),
+        "agent_session_count": len(representatives),
+        "root_session_count": root_count,
+        "subagent_session_count": sum(1 for item in representatives.values()
+                                      if item["role"] == "subagent"),
+        "aggregate_usage": aggregate,
+        "usage_sessions": usage_sessions,
+        "sessions": sessions,
+    }
+
+
+def codex_trajectory_bundle_usage(bundle: dict) -> dict:
+    """Return the compact accounting/audit view of a full bundle."""
+    return {
+        "schema": bundle["schema_version"],
+        "complete": bundle["complete"],
+        "session_file_count": bundle["session_file_count"],
+        "agent_session_count": bundle["agent_session_count"],
+        "root_session_count": bundle["root_session_count"],
+        "subagent_session_count": bundle["subagent_session_count"],
+        **bundle["aggregate_usage"],
+        "sessions": bundle["usage_sessions"],
+    }
+
+
+def aggregate_codex_session_usage(trial_dir: Path) -> dict | None:
+    """Build a bundle and return its compact accounting/audit view."""
+    bundle = build_codex_trajectory_bundle(trial_dir)
+    return codex_trajectory_bundle_usage(bundle) if bundle is not None else None
+
+
 def local_deep_swe_commit(tasks_root: Path) -> str | None:
     """HEAD commit of the volunteer's deep-swe checkout, or None when git is
     unavailable or tasks_root isn't inside a work tree (e.g. a plain tarball
