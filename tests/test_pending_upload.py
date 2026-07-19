@@ -111,6 +111,172 @@ def test_upload_success_clears_ledger(tmp_path: Path, monkeypatch):
     assert pending.load(tmp_path) == []
 
 
+def _write_codex_session(path: Path, session_id: str, role: str,
+                         input_tokens: int | None, cached: int = 0,
+                         output: int = 0, parent: str | None = None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    source = "exec" if role == "user" else {
+        "subagent": {"thread_spawn": {"parent_thread_id": parent}}}
+    events = [{"type": "session_meta", "payload": {
+        "id": session_id, "thread_source": role, "source": source}}]
+    events += [
+        {"type": "event_msg", "payload": {"type": "task_started"}},
+        {"type": "turn_context", "payload": {"model": "gpt-5.6-terra"}},
+    ]
+    if input_tokens is not None:
+        events.append({"type": "event_msg", "payload": {
+            "type": "token_count", "info": {"total_token_usage": {
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached,
+                "output_tokens": output,
+                "reasoning_output_tokens": 0,
+                "total_tokens": input_tokens + output,
+            }}}})
+    path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+
+def test_upload_replaces_pier_cost_with_complete_multi_agent_sum(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    (trial_dir / "result.json").write_text(json.dumps({"agent_result": {
+        "cost_usd": 1.23, "n_input_tokens": 50,
+        "n_cache_tokens": 20, "n_output_tokens": 5}}))
+    sessions = trial_dir / "agent" / "sessions"
+    _write_codex_session(sessions / "root.jsonl", "root-1", "user",
+                         100, 60, 10)
+    _write_codex_session(sessions / "child.jsonl", "child-1", "subagent",
+                         50, 20, 5, parent="root-1")
+
+    class CaptureClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            assert meta["cost_usd"] is None
+            assert meta["n_input_tokens"] == 150
+            assert meta["n_cache_tokens"] == 80
+            assert meta["n_output_tokens"] == 15
+            assert meta["usage_aggregation_complete"] is True
+            assert meta["subagent_session_count"] == 1
+            assert len(meta["agent_session_usage"]) == 2
+            bundle = json.loads(trajectory_bundle.read_text())
+            assert bundle["schema_version"] == meta["usage_aggregation"]
+            assert len(bundle["sessions"]) == 2
+            uploaded = json.loads(result.read_text())
+            agent = uploaded["agent_result"]
+            assert agent["cost_usd"] is None
+            assert agent["n_input_tokens"] == 150
+            assert agent["metadata"]["codex_session_usage"]["complete"] is True
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    outcome = runloop._upload_trial(
+        CaptureClient(lambda _aid: None), _entry(trial_dir, meta={"cost_usd": 1.23}))
+    assert outcome == "submitted"
+
+
+def test_upload_leaves_single_session_cost_and_metadata_unchanged(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    original_result = {"agent_result": {
+        "cost_usd": 1.23, "n_input_tokens": 50,
+        "n_cache_tokens": 20, "n_output_tokens": 5}}
+    (trial_dir / "result.json").write_text(json.dumps(original_result))
+    _write_codex_session(
+        trial_dir / "agent" / "sessions" / "root.jsonl",
+        "root-1", "user", 50, 20, 5,
+    )
+
+    original_meta = {
+        "cost_usd": 1.23, "n_input_tokens": 50,
+        "n_cache_tokens": 20, "n_output_tokens": 5,
+    }
+
+    class CaptureClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            assert meta == original_meta
+            assert json.loads(result.read_text()) == original_result
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    outcome = runloop._upload_trial(
+        CaptureClient(lambda _aid: None),
+        _entry(trial_dir, meta=original_meta),
+    )
+    assert outcome == "submitted"
+
+
+def test_upload_suppresses_cost_when_any_subagent_usage_is_missing(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    (trial_dir / "result.json").write_text(json.dumps({"agent_result": {
+        "cost_usd": 1.23, "n_input_tokens": 50}}))
+    sessions = trial_dir / "agent" / "sessions"
+    _write_codex_session(sessions / "root.jsonl", "root-1", "user", 100, 60, 10)
+    _write_codex_session(sessions / "child.jsonl", "child-1", "subagent",
+                         None, parent="root-1")
+
+    class CaptureClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            assert meta["cost_usd"] is None
+            assert meta["n_input_tokens"] is None
+            assert meta["usage_aggregation_complete"] is False
+            assert trajectory_bundle is not None
+            agent = json.loads(result.read_text())["agent_result"]
+            assert agent["cost_usd"] is None
+            assert agent["n_input_tokens"] is None
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    outcome = runloop._upload_trial(
+        CaptureClient(lambda _aid: None), _entry(trial_dir, meta={"cost_usd": 1.23}))
+    assert outcome == "submitted"
+
+
+def test_retry_rebuilds_and_resends_multi_agent_bundle(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    (trial_dir / "result.json").write_text(json.dumps({"agent_result": {
+        "cost_usd": 1.23}}))
+    sessions = trial_dir / "agent" / "sessions"
+    _write_codex_session(sessions / "root.jsonl", "root-1", "user", 100, 60, 10)
+    _write_codex_session(sessions / "child.jsonl", "child-1", "subagent",
+                         50, 20, 5, parent="root-1")
+
+    class FlakyClient(FakeClient):
+        def __init__(self):
+            super().__init__(lambda _aid: None)
+            self.attempts = 0
+
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            self.attempts += 1
+            assert trajectory_bundle is not None
+            assert json.loads(trajectory_bundle.read_text())["complete"] is True
+            if self.attempts == 1:
+                raise ApiError("server returned 503: retry", status_code=503)
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    client = FlakyClient()
+    first = runloop._upload_trial(
+        client, _entry(trial_dir, meta={"cost_usd": 1.23}))
+    assert first == "upload-failed"
+    retry_entry = pending.load(tmp_path)[0]
+    second = runloop._upload_trial(client, retry_entry)
+    assert second == "submitted"
+    assert client.attempts == 2
+    assert pending.load(tmp_path) == []
+
+
 def test_upload_omits_malformed_optional_trajectory(tmp_path: Path, monkeypatch, capsys):
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     trial_dir = _make_trial_dir(tmp_path)

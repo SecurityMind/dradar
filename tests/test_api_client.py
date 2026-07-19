@@ -167,6 +167,25 @@ def test_submit_sends_three_parts_and_client_meta_as_json_string(tmp_path):
     assert json.dumps({"dradar_version": "0.test"}).encode() in body
 
 
+def test_submit_sends_multi_agent_trajectory_bundle(tmp_path):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = request.read()
+        return httpx.Response(200, json={"submission_id": "s1", "grade_status": "pending"})
+
+    patch = tmp_path / "model.patch"
+    patch.write_text("diff")
+    bundle = tmp_path / "trajectory_bundle.json"
+    bundle.write_text('{"schema_version":"dradar-codex-trajectory-bundle-v1"}')
+    _client(handler).submit(
+        "a1", "nonce", patch, None, None, {}, trajectory_bundle=bundle,
+    )
+    body = seen["body"]
+    assert b'name="trajectory_bundle"' in body
+    assert b'filename="trajectory_bundle.json"' in body
+
+
 def test_submit_sends_resume_generation_when_fenced(tmp_path):
     seen = {}
 
