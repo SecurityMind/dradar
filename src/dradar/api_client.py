@@ -18,7 +18,8 @@ def _env_proxies_set() -> bool:
 
 
 class ApiError(RuntimeError):
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(self, message: str, status_code: int | None = None,
+                 code: str | None = None):
         # None means "never got a real HTTP response" (DNS/connect/timeout) —
         # callers that need to branch on a specific status (e.g. 409 vs 410)
         # must check this instead of grepping the message, which can contain
@@ -26,6 +27,10 @@ class ApiError(RuntimeError):
         # same digits as a status code.
         super().__init__(message)
         self.status_code = status_code
+        # Stable application error code from newer servers. ``None`` is
+        # expected for transport failures and older deployments; callers must
+        # retain a conservative compatibility fallback for those responses.
+        self.code = code
 
 
 class ApiClient:
@@ -71,13 +76,21 @@ class ApiClient:
     def _check(self, resp: httpx.Response) -> dict[str, Any]:
         if resp.status_code >= 400:
             detail: Any = resp.text
+            code = None
             try:
                 body = resp.json()
                 if isinstance(body, dict):
                     detail = body.get("detail", resp.text)
+                    raw_code = body.get("code")
+                    if isinstance(raw_code, str):
+                        code = raw_code
             except (json.JSONDecodeError, ValueError):
                 pass
-            raise ApiError(f"server returned {resp.status_code}: {detail}", status_code=resp.status_code)
+            raise ApiError(
+                f"server returned {resp.status_code}: {detail}",
+                status_code=resp.status_code,
+                code=code,
+            )
         return resp.json()
 
     def register(self, nickname: str) -> dict[str, Any]:
