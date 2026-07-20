@@ -111,6 +111,32 @@ def test_assignment_lock_fences_a_second_worker_only_for_same_assignment(tmp_pat
             pass
 
 
+def test_terminal_evidence_is_listed_but_never_selected_for_resume(tmp_path: Path):
+    aid = "c" * 32
+    item = _make_checkpoint(tmp_path, aid)
+    checkpoints.mark_terminal(tmp_path, item)
+    assert len(checkpoints.scan(tmp_path)) == 1
+    assert checkpoints.is_terminal(tmp_path, checkpoints.scan(tmp_path)[0])
+    assert checkpoints.latest_by_assignment(tmp_path) == {}
+
+
+def test_discarding_terminal_evidence_never_releases_server_lease(
+        tmp_path: Path, monkeypatch, capsys):
+    aid = "d" * 32
+    item = _make_checkpoint(tmp_path, aid)
+    checkpoints.mark_terminal(tmp_path, item)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(
+        runloop, "_load_config",
+        lambda: pytest.fail("terminal evidence removal must stay local"),
+    )
+    assert runloop.cmd_checkpoint_discard(
+        argparse.Namespace(checkpoint_id=aid),
+    ) == 0
+    assert checkpoints.scan(tmp_path) == []
+    assert "server lease left unchanged" in capsys.readouterr().out
+
+
 class _RecoveryClient:
     def __init__(self, assignment):
         self.assignment = assignment

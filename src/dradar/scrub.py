@@ -2,11 +2,12 @@
 
 Two artifact classes, two mechanisms (design doc):
 
-- **Integrity-critical** (model.patch): its bytes must match the target repo
-  exactly or `git apply` fails during grading. NEVER rewrite it. Instead
-  DETECT secrets and reject/quarantine on a hit (`scan_secrets`). Detection is
-  high-precision so a legitimate patch (editing a lockfile hash, a fixture
-  email) is not falsely rejected.
+- **Integrity-critical** (model.patch): detect secrets first. A secret may be
+  redacted only from an added line inside a unified-diff hunk; added content
+  is not used to locate the hunk, so context/deletion applicability stays
+  unchanged. Hits anywhere else remain quarantined. The sanitized copy must
+  parse as a patch and pass a second secret scan before upload. The raw patch
+  is never rewritten.
 
 - **Display** (trajectory.json, result.json): shown in the public viewer, so
   redact destructively (`scrub_bytes`). Over-redaction is acceptable here.
@@ -18,6 +19,7 @@ are still caught.
 """
 
 import re
+import subprocess
 from pathlib import Path
 
 # High-precision credential shapes — used to DETECT secrets in a patch. Kept
@@ -40,9 +42,9 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     )),
 ]
 
-# Destructive rewrites for DISPLAY artifacts only. (pattern, replacement).
-# Reuses the secret patterns plus PII that is fine to redact in a trajectory.
-_SCRUB_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+# Credential-only rewrites. These may be applied to added patch lines and are
+# also a subset of the more aggressive display-artifact scrubber below.
+_SECRET_SCRUB_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"sk-ant-[A-Za-z0-9_-]{16,}"), "[REDACTED-SK-ANT]"),
     (re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{16,}"), "[REDACTED-SK]"),
     (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "[REDACTED-GHP]"),
@@ -55,6 +57,12 @@ _SCRUB_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret)"
         r"[\"']?\s*[:=]\s*[\"']?)[A-Za-z0-9._~+/-]{16,}=*"
     ), r"\1[REDACTED]"),
+]
+
+# Destructive rewrites for DISPLAY artifacts only. PII is safe to redact in a
+# trajectory but must not be rewritten in executable source patches.
+_SCRUB_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    *_SECRET_SCRUB_PATTERNS,
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "[REDACTED-EMAIL]"),
 ]
 
@@ -73,6 +81,49 @@ def scan_secrets(data: bytes) -> list[str]:
     caller (patch handler) should reject/quarantine rather than store."""
     text = _decode(data)
     return [label for label, pat in _SECRET_PATTERNS if pat.search(text)]
+
+
+def redact_patch_secrets(data: bytes) -> tuple[bytes, list[str], list[str]]:
+    """Redact credentials only from added unified-diff hunk lines.
+
+    Returns ``(redacted_bytes, redacted_labels, unsafe_labels)``. Any label in
+    ``unsafe_labels`` means a credential occurred in metadata, context, or a
+    deletion line; rewriting it could change hunk matching, so callers must
+    quarantine instead of uploading. Arbitrary non-UTF-8 bytes round-trip.
+    """
+    in_hunk = False
+    output: list[str] = []
+    redacted: set[str] = set()
+    unsafe: set[str] = set()
+    for line in _decode(data).splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            in_hunk = False
+        elif line.startswith("@@"):
+            in_hunk = True
+        hits = {label for label, pattern in _SECRET_PATTERNS if pattern.search(line)}
+        if hits:
+            if in_hunk and line.startswith("+"):
+                for pattern, replacement in _SECRET_SCRUB_PATTERNS:
+                    line = pattern.sub(replacement, line)
+                redacted.update(hits)
+            else:
+                unsafe.update(hits)
+        output.append(line)
+    encoded = "".join(output).encode("utf-8", errors="surrogateescape")
+    return encoded, sorted(redacted), sorted(unsafe)
+
+
+def patch_structure_is_valid(data: bytes) -> bool:
+    """Ask git to parse a diff without needing or modifying a worktree."""
+    try:
+        proc = subprocess.run(
+            ["git", "apply", "--numstat", "-"], input=data,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0
 
 
 def scrub_text(text: str) -> str:

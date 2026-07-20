@@ -74,6 +74,7 @@ class FakeClient:
     def __init__(self, behavior):
         self.behavior = behavior  # callable(assignment_id) -> dict | raises ApiError
         self.calls = []
+        self.stopped = []
 
     def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
                outcome="completed", resume_generation=None):
@@ -83,6 +84,9 @@ class FakeClient:
     def checkpoint_discard(self, assignment_id, checkpoint_id,
                            resume_generation, reason):
         self.discarded = (assignment_id, checkpoint_id, resume_generation, reason)
+
+    def mark_stopped(self, assignment_id):
+        self.stopped.append(assignment_id)
 
 
 def _make_trial_dir(tmp_path: Path, name: str = "t") -> Path:
@@ -493,18 +497,87 @@ def test_transient_failure_with_409_in_message_is_not_misread_as_conflict(tmp_pa
     assert len(pending.load(tmp_path)) == 1  # entry survives for a real retry
 
 
-def test_secret_patch_not_retryable_clears_any_ledger_entry(tmp_path: Path, monkeypatch, capsys):
+def test_secret_in_added_patch_line_is_redacted_and_uploaded(tmp_path: Path, monkeypatch, capsys):
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     trial_dir = tmp_path / "t"
     (trial_dir / "artifacts").mkdir(parents=True)
     (trial_dir / "artifacts" / "model.patch").write_text(
-        "diff --git a b\n+ghp_ABCDEFghijkl0123456789ABCDEFghijkl0123\n")
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n old = True\n"
+        "+api_key = \"ghp_ABCDEFghijkl0123456789ABCDEFghijkl0123\"\n")
     pending.record(tmp_path, {"assignment_id": "a1", "task_id": "t1"})
-    client = FakeClient(lambda aid: {"submission_id": "s1"})
+    uploaded = {}
+
+    class CaptureClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None):
+            uploaded["patch"] = patch.read_bytes()
+            uploaded["meta"] = meta
+            self.calls.append(assignment_id)
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    client = CaptureClient(lambda _aid: None)
     outcome = runloop._upload_trial(client, _entry(trial_dir))
-    assert outcome == "not-uploaded"
-    assert pending.load(tmp_path) == []  # not left to retry forever against the same secret
-    assert not client.calls  # never even attempted the upload
+    assert outcome == "submitted"
+    assert pending.load(tmp_path) == []
+    assert b"ghp_" not in uploaded["patch"]
+    assert uploaded["meta"]["patch_redacted"] is True
+    assert "GHP" in uploaded["meta"]["patch_redaction_labels"]
+    assert client.stopped == []
+
+
+def test_secret_in_patch_context_is_not_uploaded_and_assignment_is_stopped(
+        tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = tmp_path / "t"
+    (trial_dir / "artifacts").mkdir(parents=True)
+    (trial_dir / "artifacts" / "model.patch").write_text(
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n"
+        " ghp_ABCDEFghijkl0123456789ABCDEFghijkl0123\n+safe = True\n")
+    client = FakeClient(lambda _aid: {"submission_id": "s1"})
+    assert runloop._upload_trial(client, _entry(trial_dir)) == "not-uploaded"
+    assert client.calls == []
+    assert client.stopped == ["a1"]
+
+
+def test_missing_patch_stops_ghost_running_assignment(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = tmp_path / "missing"
+    trial_dir.mkdir()
+    client = FakeClient(lambda _aid: {"submission_id": "s1"})
+    assert runloop._upload_trial(client, _entry(trial_dir)) == "artifacts-gone"
+    assert client.stopped == ["a1"]
+
+
+def test_redacted_patch_retry_never_falls_back_to_raw_secret(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = tmp_path / "t"
+    (trial_dir / "artifacts").mkdir(parents=True)
+    (trial_dir / "artifacts" / "model.patch").write_text(
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n old = True\n"
+        "+token = \"ghp_ABCDEFghijkl0123456789ABCDEFghijkl0123\"\n")
+
+    class FlakyRedactionClient(FakeClient):
+        def __init__(self):
+            super().__init__(lambda _aid: None)
+            self.patches = []
+
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None):
+            self.patches.append(patch.read_bytes())
+            if len(self.patches) == 1:
+                raise ApiError("temporary", status_code=503)
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    client = FlakyRedactionClient()
+    assert runloop._upload_trial(client, _entry(trial_dir)) == "upload-failed"
+    retry_entry = pending.load(tmp_path)[0]
+    assert runloop._upload_trial(client, retry_entry) == "submitted"
+    assert len(client.patches) == 2
+    assert all(b"ghp_" not in patch for patch in client.patches)
+    assert pending.load(tmp_path) == []
 
 
 def test_crash_mid_submit_leaves_a_ledger_entry(tmp_path: Path, monkeypatch):
@@ -675,12 +748,14 @@ def test_definitively_rejected_upload_drops_ledger_entry(tmp_path: Path, monkeyp
     would just re-fail identically on every future `dradar go`."""
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     trial_dir = _make_trial_dir(tmp_path)
-    outcome = runloop._upload_trial(FakeClient(_raise(413)), _entry(trial_dir))
+    client = FakeClient(_raise(413))
+    outcome = runloop._upload_trial(client, _entry(trial_dir))
     assert outcome == "rejected"
     assert pending.load(tmp_path) == []
     out = capsys.readouterr().out
     assert "retrying can't fix it" in out
     assert str(trial_dir) in out  # the local files are named, not vaporized
+    assert client.stopped == ["a1"]
 
 
 def test_definitive_rejection_preserves_checkpoint_job(tmp_path: Path, monkeypatch):
@@ -705,16 +780,20 @@ def test_definitive_rejection_preserves_checkpoint_job(tmp_path: Path, monkeypat
     assert outcome == "rejected"
     assert job.is_dir()
     assert (job / checkpoints.KEEP_MARKER).is_file()
-    assert client.discarded[0] == aid
+    assert (job / checkpoints.TERMINAL_MARKER).is_file()
+    assert checkpoints.find_latest(tmp_path, aid) is None
+    assert client.stopped == [aid]
 
 
 def test_transient_5xx_keeps_ledger_entry(tmp_path: Path, monkeypatch):
     """Negative control: a 503 is retryable and must stay queued."""
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     trial_dir = _make_trial_dir(tmp_path)
-    outcome = runloop._upload_trial(FakeClient(_raise(503)), _entry(trial_dir))
+    client = FakeClient(_raise(503))
+    outcome = runloop._upload_trial(client, _entry(trial_dir))
     assert outcome == "upload-failed"
     assert [e["assignment_id"] for e in pending.load(tmp_path)] == ["a1"]
+    assert client.stopped == []
 
 
 def test_403_stays_retryable_by_policy(tmp_path: Path, monkeypatch):
