@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 from typing import Any, Iterable
 
@@ -84,6 +85,23 @@ def _filter_rows(rows: list[dict[str, Any]], args) -> list[dict[str, Any]]:
     return filtered
 
 
+def _validate_priority_support(rows: list[dict[str, Any]], args) -> bool:
+    """Reject priority operations when the server published no such signal.
+
+    The table API omits ``suggest_priority`` for ordinary cells and only adds
+    it when at least one cell has an explicit recommendation override.  An
+    all-missing response therefore means "priority is unavailable", not that
+    every cell has a meaningful priority of zero.
+    """
+    available = any("suggest_priority" in row for row in rows)
+    if not available and (args.min_priority is not None or args.sort == "priority"):
+        sys.exit(
+            "this server does not publish recommendation priority data — "
+            "remove --min-priority/--sort priority"
+        )
+    return available
+
+
 def _sort_rows(rows: list[dict[str, Any]], field: str, reverse: bool) -> None:
     key = _SORT_FIELDS[field]
     populated = [row for row in rows if row.get(key) is not None]
@@ -113,9 +131,10 @@ def _fmt_number(value: Any, suffix: str = "") -> str:
     return rendered + suffix
 
 
-def _print_rows(rows: list[dict[str, Any]]) -> None:
+def _print_rows(rows: list[dict[str, Any]], *, show_priority: bool) -> None:
+    priority_header = f" {'PRI':>4s}" if show_priority else ""
     print(f"{'STATE':8s} {'TASK':38s} {'MODEL':16s} {'EFFORT':7s} "
-          f"{'MULT':>6s} {'PRI':>4s} {'TESTS':>5s} {'PASS':>6s} "
+          f"{'MULT':>6s}{priority_header} {'TESTS':>5s} {'PASS':>6s} "
           f"{'MIN':>5s} {'COST':>7s}")
     for row in rows:
         task = str(row["task_id"])
@@ -123,15 +142,25 @@ def _print_rows(rows: list[dict[str, Any]]) -> None:
             task = task[:35] + "..."
         rate = row.get("rate")
         pass_rate = "-" if rate is None else f"{rate * 100:.0f}%"
+        priority_value = (
+            f" {_fmt_number(row.get('suggest_priority', 0)):>4s}"
+            if show_priority else ""
+        )
         print(
             f"{str(row.get('st', '?')):8.8s} {task:38s} "
             f"{str(row['model']):16.16s} {str(row['effort']):7.7s} "
-            f"{_fmt_number(row.get('mult'), 'x'):>6s} "
-            f"{_fmt_number(row.get('suggest_priority', 0)):>4s} "
+            f"{_fmt_number(row.get('mult'), 'x'):>6s}{priority_value} "
             f"{_fmt_number(row.get('total_n')):>5s} {pass_rate:>6s} "
             f"{_fmt_number(row.get('min')):>5s} "
             f"{('-' if row.get('cost') is None else '$' + _fmt_number(row['cost'])):>7s}"
         )
+
+
+def _print_pick_rows(rows: list[dict[str, Any]]) -> None:
+    """Emit command-only output with complete, shell-safe cell identifiers."""
+    for row in rows:
+        spec = f"{row['task_id']}:{row['model']}:{row['effort']}"
+        print(f"dradar go --pick {shlex.quote(spec)}")
 
 
 def cmd_cells(args) -> int:
@@ -148,6 +177,7 @@ def cmd_cells(args) -> int:
         sys.exit(f"could not load cells: {exc}")
 
     all_rows = _rows(table)
+    priority_available = _validate_priority_support(all_rows, args)
     rows = _filter_rows(all_rows, args)
     _sort_rows(rows, args.sort, args.reverse)
     matched = len(rows)
@@ -162,9 +192,13 @@ def cmd_cells(args) -> int:
         }, ensure_ascii=False, indent=2))
         return 0
 
+    if args.format == "pick":
+        _print_pick_rows(shown)
+        return 0
+
     print(f"{len(all_rows)} total cells; {matched} matched; showing {len(shown)}")
     if shown:
-        _print_rows(shown)
+        _print_rows(shown, show_priority=priority_available)
     else:
         print("no cells match these filters")
     if not args.all and matched > len(shown):

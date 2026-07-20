@@ -1,6 +1,8 @@
 import argparse
 import json
 
+import pytest
+
 from dradar import cells
 
 
@@ -39,6 +41,7 @@ def _args(**overrides):
         model=None, effort=None, available=False, state=None, task=None,
         min_multiplier=None, min_tests=None, max_tests=None, min_priority=None,
         sort="multiplier", reverse=False, limit=20, all=False, json=True,
+        format="table",
     )
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -87,3 +90,56 @@ def test_cells_limit_reports_full_match_count(monkeypatch, capsys):
     assert [row["task_id"] for row in result["cells"]] == [
         "alpha-task", "beta-task",
     ]
+
+
+def test_cells_without_priority_hides_column_and_rejects_priority_operations(
+        monkeypatch, capsys):
+    table = {
+        "cells": {
+            key: {k: v for k, v in value.items() if k != "suggest_priority"}
+            for key, value in TABLE["cells"].items()
+        }
+    }
+
+    class NoPriorityClient(FakeClient):
+        def table(self):
+            return table
+
+    monkeypatch.setattr(cells, "_load_config", lambda: {
+        "server": "https://api.example.com"
+    })
+    monkeypatch.setattr(cells, "ApiClient", NoPriorityClient)
+
+    assert cells.cmd_cells(_args(json=False)) == 0
+    output = capsys.readouterr().out
+    assert "PRI" not in output.splitlines()[1]
+
+    with pytest.raises(SystemExit, match="does not publish recommendation priority"):
+        cells.cmd_cells(_args(sort="priority"))
+    with pytest.raises(SystemExit, match="does not publish recommendation priority"):
+        cells.cmd_cells(_args(min_priority=1))
+
+
+def test_cells_pick_format_keeps_full_task_id(monkeypatch, capsys):
+    task = "dynamodb-toolbox-conditional-attribute-requirements"
+
+    class LongTaskClient(FakeClient):
+        def table(self):
+            return {
+                "cells": {
+                    f"{task}|gpt-5.6-sol|high": {
+                        "st": "open", "mult": 2.0, "total_n": 0,
+                    }
+                }
+            }
+
+    monkeypatch.setattr(cells, "_load_config", lambda: {
+        "server": "https://api.example.com"
+    })
+    monkeypatch.setattr(cells, "ApiClient", LongTaskClient)
+
+    assert cells.cmd_cells(_args(json=False, format="pick")) == 0
+    assert capsys.readouterr().out == (
+        "dradar go --pick "
+        "dynamodb-toolbox-conditional-attribute-requirements:gpt-5.6-sol:high\n"
+    )
