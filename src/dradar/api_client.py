@@ -128,6 +128,15 @@ class ApiClient:
         account-specific recommendation limits."""
         return self._get(f"/api/v1/suggest?n={n}")
 
+    def table(self) -> dict[str, Any]:
+        """Public full-board snapshot.
+
+        Returns the server's task/config matrix plus the live state and
+        coverage metadata for every cell.  Unlike suggest() this is not
+        personalized and never claims or reserves work.
+        """
+        return self._get("/api/v1/table")
+
     def mark_started(
         self, assignment_id: str, session_id: str | None = None,
     ) -> dict[str, Any]:

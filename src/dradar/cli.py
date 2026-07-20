@@ -20,6 +20,7 @@ import sys
 
 from . import __version__
 from .capacity import cmd_capacity
+from .cells import cmd_cells
 from .doctor import cmd_doctor
 from .identity import cmd_link_github, cmd_login, cmd_rename, cmd_status
 from .leases import cmd_leases, cmd_release
@@ -38,6 +39,16 @@ def _workers_value(value: str) -> int | str:
         return int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be an integer or 'auto'") from exc
+
+
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -63,6 +74,43 @@ def main(argv: list[str] | None = None) -> int:
     p_capacity = sub.add_parser(
         "capacity", help="recommend a safe local worker count from Docker resources")
     p_capacity.set_defaults(func=cmd_capacity)
+
+    p_cells = sub.add_parser(
+        "cells", help="browse and filter the full public cell table (read-only)")
+    p_cells.add_argument(
+        "--model", action="append", metavar="MODEL",
+        help="only this model; repeat or comma-separate for several")
+    p_cells.add_argument(
+        "--effort", action="append", metavar="EFFORT",
+        help="only this reasoning effort; repeat or comma-separate for several")
+    state = p_cells.add_mutually_exclusive_group()
+    state.add_argument(
+        "--available", action="store_true", help="show only currently open cells")
+    state.add_argument(
+        "--state", action="append",
+        choices=("open", "leased", "running", "queued", "cooldown"),
+        help="only this state; repeat for several")
+    p_cells.add_argument("--task", metavar="TEXT", help="task ID contains this text")
+    p_cells.add_argument("--min-multiplier", type=float, metavar="X")
+    p_cells.add_argument("--min-tests", type=_nonnegative_int, metavar="N")
+    p_cells.add_argument("--max-tests", type=_nonnegative_int, metavar="N")
+    p_cells.add_argument("--min-priority", type=int, metavar="N")
+    p_cells.add_argument(
+        "--sort", default="multiplier",
+        choices=("multiplier", "tests", "pass-rate", "minutes", "cost",
+                 "priority", "task", "model", "effort", "state"),
+        help="sort field (default: multiplier; numeric fields highest first)")
+    p_cells.add_argument(
+        "--reverse", action="store_true", help="reverse the natural sort direction")
+    display_count = p_cells.add_mutually_exclusive_group()
+    display_count.add_argument(
+        "--limit", type=_nonnegative_int, default=20, metavar="N",
+        help="maximum rows to show (default: 20)")
+    display_count.add_argument(
+        "--all", action="store_true", help="show every matching row")
+    p_cells.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON")
+    p_cells.set_defaults(func=cmd_cells)
 
     p_ren = sub.add_parser("rename", help="change your leaderboard name (points stay)")
     p_ren.add_argument("nickname")

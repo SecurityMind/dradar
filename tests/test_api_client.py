@@ -47,6 +47,18 @@ def test_suggest_passes_n_and_returns_cells():
     assert got == {"cells": [{"task_id": "t1"}]}
 
 
+def test_table_fetches_public_full_board():
+    seen = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        return httpx.Response(200, json={"cells": {"t1|m|low": {"st": "open"}}})
+
+    got = _client(handler).table()
+    assert seen["path"] == "/api/v1/table"
+    assert got["cells"]["t1|m|low"]["st"] == "open"
+
+
 def test_checkout_sends_failed_cell_exclusions():
     seen = {}
 

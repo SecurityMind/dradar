@@ -47,6 +47,26 @@ dradar capacity                      # 查看本机保守推荐并发数
 dradar resume --workers auto         # 按 Docker CPU/内存、磁盘和账号上限自动选择
 ```
 
+### 在 CLI 中查看全量格子
+
+`dradar cells` 读取与网页大表相同的公开 `/api/v1/table` 快照，只查看、不认领。
+默认按当前积分倍率从高到低显示前 20 个格子；可以组合模型、推理强度、状态、任务名、
+倍率和测试量条件，并切换排序字段：
+
+```bash
+dradar cells --available --model gpt-5.5 --effort xhigh
+dradar cells --available --min-multiplier 2 --sort multiplier
+dradar cells --model gpt-5.6-sol --max-tests 2 --sort tests --reverse
+dradar cells --state cooldown --task cache --sort minutes
+dradar cells --available --all --json
+```
+
+`--model`、`--effort` 和 `--state` 可以重复使用；模型和推理强度也接受逗号分隔。
+数值排序默认从高到低，文本排序默认按字母顺序，`--reverse` 反转方向。
+`--limit N` 控制显示数量（默认 20），`--all` 返回全部匹配项。表是公开快照，
+查看到的开放格子仍可能在随后认领前被其他人抢走；实际领取仍由
+`dradar go --pick TASK:MODEL:EFFORT` 或 `dradar go --auto N` 完成。
+
 父进程只认领一次任务，再由服务端原子地给各 worker 分题，不会让多个 worker 重复
 执行同一道题。worker 共享本机 CPU、内存和模型额度；未传 `-y` 时会在启动前确认一次。
 中断或部分 worker 启动失败时，父进程会统一停止已经启动的 worker，已完成上传和
