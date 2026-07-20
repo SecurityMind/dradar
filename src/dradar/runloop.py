@@ -168,7 +168,8 @@ def _claim_cell(client: ApiClient, task_id: str, model: str, effort: str) -> dic
     except ApiError as exc:
         if exc.status_code != 409:
             raise
-        if "already holding" in str(exc):
+        if (exc.code == "claim_limit_reached"
+                or (exc.code is None and "already holding" in str(exc))):
             raise _ConcurrentCapHit(str(exc)) from exc
         print(f"  {task_id}/{model}@{effort}: not claimed ({exc})")
         return None

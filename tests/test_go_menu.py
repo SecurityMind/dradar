@@ -193,14 +193,34 @@ def test_auto_skips_a_stale_suggestion_and_keeps_going(monkeypatch, capsys, tmp_
 def test_auto_stops_clean_at_the_concurrent_cap(monkeypatch, capsys, tmp_path: Path):
     suggested = [{"task_id": "t1", "model": "m", "effort": "e"},
                  {"task_id": "t2", "model": "m", "effort": "e"}]
-    claims = [ApiError("you're already holding 10 cells (max 10) — run or finish "
-                       "some before claiming more", status_code=409)]
+    claims = [ApiError(
+        "server returned 409: 已达到持有上限",
+        status_code=409,
+        code="claim_limit_reached",
+    )]
     client = FakeClient({"active": [], "free_pick": True, "menu": None},
                         claims=claims, suggested=suggested)
     rc = runloop._go_menu(_args(yes=True, auto=2), {}, client, tmp_path)
     assert client.claim_calls == [("t1", "m", "e")]   # never tried t2 — cap already hit
     out = capsys.readouterr().out
-    assert "stopping —" in out and "already holding" in out
+    assert "stopping —" in out and "已达到持有上限" in out
+    assert rc == 0
+
+
+def test_auto_legacy_server_still_detects_concurrent_cap(monkeypatch, capsys, tmp_path: Path):
+    suggested = [{"task_id": "t1", "model": "m", "effort": "e"},
+                 {"task_id": "t2", "model": "m", "effort": "e"}]
+    claims = [ApiError(
+        "you're already holding 10 cells (max 10) — run or finish some",
+        status_code=409,
+    )]
+    client = FakeClient({"active": [], "free_pick": True, "menu": None},
+                        claims=claims, suggested=suggested)
+
+    rc = runloop._go_menu(_args(yes=True, auto=2), {}, client, tmp_path)
+
+    assert client.claim_calls == [("t1", "m", "e")]
+    assert "stopping —" in capsys.readouterr().out
     assert rc == 0
 
 

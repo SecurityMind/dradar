@@ -17,12 +17,26 @@ def _client(handler, token="drt_test"):
 
 def test_http_error_attaches_status_code_and_detail():
     def handler(request):
-        return httpx.Response(409, json={"detail": "cell went stale"})
+        return httpx.Response(409, json={
+            "detail": "cell went stale", "code": "cell_unavailable",
+        })
 
     with pytest.raises(ApiError) as ei:
         _client(handler).get_assignment()
     assert ei.value.status_code == 409
+    assert ei.value.code == "cell_unavailable"
     assert "cell went stale" in str(ei.value)
+
+
+def test_legacy_http_error_without_code_remains_compatible():
+    def handler(request):
+        return httpx.Response(409, json={"detail": "legacy conflict"})
+
+    with pytest.raises(ApiError) as ei:
+        _client(handler).get_assignment()
+    assert ei.value.status_code == 409
+    assert ei.value.code is None
+    assert "legacy conflict" in str(ei.value)
 
 
 def test_transport_failure_has_no_status_code():
@@ -32,6 +46,7 @@ def test_transport_failure_has_no_status_code():
     with pytest.raises(ApiError) as ei:
         _client(handler).whoami()
     assert ei.value.status_code is None
+    assert ei.value.code is None
     assert "cannot reach" in str(ei.value)
 
 
