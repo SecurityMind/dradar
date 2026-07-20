@@ -1200,9 +1200,18 @@ def cmd_go(args) -> int:
             return 1
         if found_checkpoints and getattr(args, "resume", False) and not recovered:
             # Every matching checkpoint is already owned by another local
-            # worker. Do not fall through and compete for newly dispensed work.
-            close_reason = "paused"
-            return 1
+            # worker. A supervised worker child may safely continue to the
+            # server's atomic checkout dispenser: paused/running checkpoint
+            # assignments already have started_at and cannot be dispensed,
+            # while a different waiting assignment can fill this worker slot.
+            # Keep standalone/manual --parallel conservative because it was
+            # not launched as part of one confirmed worker pool.
+            if getattr(args, "worker_child", False):
+                print("checkpoint is already owned by another local worker; "
+                      "checking for a different waiting task")
+            else:
+                close_reason = "paused"
+                return 1
 
         rc = _go_menu(args, cfg, client, tasks_root, telemetry=telemetry)
         close_reason = "completed" if rc == 0 else "paused"
