@@ -1,7 +1,7 @@
 [project]
 name = "dradar"
 version = "0.5.18"
-description = "DRadar crowdtest client — run DeepSWE benchmark tasks on your own subscription, submit for independent server-side grading"
+description = "Distributed Radar client — run benchmark tasks locally and submit them for independent server-side grading"
 requires-python = ">=3.11"
 dependencies = ["httpx[socks]>=0.27"]
 

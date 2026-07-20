@@ -1,8 +1,12 @@
-# dradar — DeepSWE 众测 CLI
+# dradar — 分布式雷达客户端 CLI
 
-`dradar` 是运行在志愿者自己电脑上的 DeepSWE 众测客户端。它负责查看和领取任务、在
-Docker 沙箱中调用本机已经登录的 Codex/Claude、保存中断恢复点、上传结果，并查看服务端
-的独立判分。调度、判分和榜单由服务端完成，不在本仓库中。
+`dradar` 是分布式雷达的开源客户端，运行在参与者自己的电脑上。它负责连接雷达服务、
+查看和领取 benchmark 任务、在隔离环境中调用本机已经登录的模型工具、保存中断恢复点、
+上传结果，并查看服务端的独立判分。调度、判分和榜单由服务端完成，不在本仓库中。
+
+CLI 的核心能力围绕通用的 benchmark 运行流程设计，包括格子、租约、worker、checkpoint、
+artifact 和判分结果，不把产品定位绑定到某一个题库。当前主站首先接入 DeepSWE，并使用
+Pier + Docker 作为现阶段的任务执行方案；未来可以继续接入其他 benchmark 和对应 runner。
 
 - 官网与任务大表：[deng.codexradar.com](https://deng.codexradar.com)
 - CLI 仓库：[github.com/SecurityMind/dradar](https://github.com/SecurityMind/dradar)
@@ -14,8 +18,8 @@ Docker 沙箱中调用本机已经登录的 Codex/Claude、保存中断恢复点
 你的机器                                      DRadar 服务端
 ┌────────────────────────────────┐           ┌────────────────────────────┐
 │ dradar cells / go / resume     │──查询/领题▶│ 推荐、原子领取、租约与心跳    │
-│  └─ Pier + Docker 沙箱          │           │                            │
-│      └─ 本机 Codex/Claude       │           │ 独立 verifier 重新判分       │
+│  └─ 当前 runner：Pier + Docker  │           │                            │
+│      └─ 本机模型工具             │           │ 独立 verifier 重新判分       │
 │  └─ checkpoint / 脱敏 / 上传    │──提交结果▶│ 积分、榜单与公开大表          │
 └────────────────────────────────┘           └────────────────────────────┘
 ```
@@ -124,11 +128,12 @@ dradar login --server https://api.codexradar.com --github
 
 # 把任务仓库放到自定义位置
 dradar login --server https://api.codexradar.com --token <YOUR_TOKEN> \
-  --tasks-root /data/deep-swe/tasks
+  --tasks-root /data/benchmark/tasks
 ```
 
 `--github` 只能恢复之前执行过 `dradar link-github` 的账号。新安装默认把任务仓库放到
-`~/.dradar/deep-swe/tasks`；升级时会保留已有的自定义路径，不会偷偷搬迁或重复克隆。
+`~/.dradar/deep-swe/tasks`。这是当前 DeepSWE 接入使用的兼容默认路径，不代表 CLI 只支持
+这一种 benchmark；升级时会保留已有的自定义路径，不会偷偷搬迁或重复克隆。
 
 ### `dradar doctor`
 
@@ -137,7 +142,7 @@ dradar login --server https://api.codexradar.com --token <YOUR_TOKEN> \
 - Docker CLI、Docker daemon 和 Compose 插件；
 - 与 DRadar 固定版本兼容的 Pier，缺失时会尝试安装；
 - Codex CLI + `auth.json`，或 Claude CLI + OAuth Token；
-- DeepSWE 任务仓库，缺失时会尝试克隆；
+- 当前 benchmark 的任务仓库（主站目前为 DeepSWE），缺失时会尝试克隆；
 - 可用磁盘和服务端登录。
 
 ```bash
@@ -295,7 +300,7 @@ dradar resume --assignment <ASSIGNMENT_ID>
 | --- | --- |
 | `-y`, `--yes` | 跳过人工确认；适合自动化。不会取消服务端领取和额度上限检查 |
 | `--keep` | 成功上传后保留最终本地任务目录，供调试或审计 |
-| `--allow-task-drift` | 允许本地 DeepSWE 内容与服务端固定版本不一致；可能影响可复现性，谨慎使用 |
+| `--allow-task-drift` | 允许本地 benchmark 任务内容与服务端固定版本不一致；可能影响可复现性，谨慎使用 |
 | `--workers N` | 由一个父进程管理 N 个并发 worker，范围 1–32，默认 1 |
 | `--workers auto` | 检测 Docker、磁盘和账号限制后选择保守并发数 |
 | `--parallel` | 高级选项：允许手工启动另一个独立 DRadar 会话；隐含 `-y` |
@@ -471,7 +476,7 @@ dradar cleanup --include-kept
 | 路径 | 内容 |
 | --- | --- |
 | `~/.dradar/config.json` | 服务端、Token 和任务仓库路径；私有文件 |
-| `~/.dradar/deep-swe/tasks/` | 默认 DeepSWE 任务仓库 |
+| `~/.dradar/deep-swe/tasks/` | 当前 DeepSWE 接入的兼容默认任务仓库路径 |
 | `~/.dradar/work/jobs/` | Pier 任务目录、artifact 和 checkpoint |
 | `~/.dradar/pending_uploads.json` | 待补传结果账本，不保存订阅凭据 |
 | `~/.dradar/refill-plan.json` | 当前持续补题计划或最近一次安全停止诊断；不会阻塞明确的新计划 |
