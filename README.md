@@ -182,6 +182,7 @@ dradar cells --available --model gpt-5.6-sol --effort high
 dradar cells --available --min-multiplier 2 --sort multiplier
 dradar cells --model gpt-5.5 --max-tests 2 --sort tests --reverse
 dradar cells --state cooldown --task cache --sort minutes
+dradar cells --available --format pick
 dradar cells --available --all --json
 ```
 
@@ -204,7 +205,7 @@ dradar cells --available --all --json
 | `TASK` | 任务 ID |
 | `MODEL` / `EFFORT` | 模型和推理强度 |
 | `MULT` | 如果此时成功领取，预计快照的积分倍率 |
-| `PRI` | 服务端推荐优先级，未设置时按 0 处理 |
+| `PRI` | 服务端推荐优先级；只有服务端实际发布优先级数据时才显示 |
 | `TESTS` | 该格子的历史测试总数 |
 | `PASS` | 最近滚动窗口中的通过率，不等于终身通过率 |
 | `MIN` | 预计运行分钟数 |
@@ -221,12 +222,18 @@ dradar cells --available --all --json
 | `--task TEXT` | 任务 ID 包含指定文本，不区分大小写 |
 | `--min-multiplier X` | 最低积分倍率 |
 | `--min-tests N` / `--max-tests N` | 历史测试数范围 |
-| `--min-priority N` | 最低推荐优先级 |
+| `--min-priority N` | 最低推荐优先级；服务端没有发布该数据时明确报错 |
 | `--sort FIELD` | `multiplier`、`tests`、`pass-rate`、`minutes`、`cost`、`priority`、`task`、`model`、`effort` 或 `state` |
 | `--reverse` | 反转默认排序方向 |
 | `--limit N` | 最多显示 N 行，默认 20 |
 | `--all` | 显示全部匹配结果，不能和 `--limit` 同时使用 |
 | `--json` | 输出适合脚本或 Codex 读取的 JSON |
+| `--format pick` | 每行输出一条包含完整任务 ID、可直接复制的 `dradar go --pick ...` 命令 |
+
+普通表格为了控制终端宽度会截断过长的任务 ID；需要精确认领时使用 `--format pick`，它只
+输出命令、不输出表头和提示信息。`suggest_priority` 是服务端可选策略字段：当整张表都没有
+这个字段时，CLI 会隐藏 `PRI`；显式按 priority 筛选或排序会报出数据不可用，而不是把缺失
+数据伪装成有意义的 0。
 
 查询与领取之间可能发生竞争：即使刚看到 `open`，也可能已被别人抢先领取。服务端会在
 数据库事务中最终确认，不会启动重复任务；CLI 会收到 `409 Conflict`。精确选题会提示

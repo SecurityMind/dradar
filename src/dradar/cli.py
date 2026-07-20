@@ -108,8 +108,12 @@ def main(argv: list[str] | None = None) -> int:
         help="maximum rows to show (default: 20)")
     display_count.add_argument(
         "--all", action="store_true", help="show every matching row")
-    p_cells.add_argument(
+    output = p_cells.add_mutually_exclusive_group()
+    output.add_argument(
         "--json", action="store_true", help="emit machine-readable JSON")
+    output.add_argument(
+        "--format", choices=("table", "pick"), default="table",
+        help="human table or copyable `dradar go --pick` commands (default: table)")
     p_cells.set_defaults(func=cmd_cells)
 
     p_ren = sub.add_parser("rename", help="change your leaderboard name (points stay)")
