@@ -90,6 +90,57 @@ def test_worker_command_never_forwards_auto_selection():
     assert "go" not in command
 
 
+class _Telemetry:
+    session_id = "session-test"
+
+    def __init__(self, _client):
+        self.closed = None
+
+    def start(self):
+        pass
+
+    def set_phase(self, _phase):
+        pass
+
+    def close(self, reason):
+        self.closed = reason
+
+
+@pytest.mark.parametrize(
+    ("worker_child", "expected_rc", "expected_checkout"),
+    ((True, 0, True), (False, 1, False)),
+)
+def test_only_supervised_worker_skips_busy_checkpoint_and_drains_waiting_work(
+        monkeypatch, capsys, worker_child, expected_rc, expected_checkout):
+    """One checkpoint owner must not leave another confirmed pool slot idle."""
+    checked_out = []
+    monkeypatch.setattr(runloop, "_load_config", lambda: {})
+    monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: object())
+    monkeypatch.setattr(runloop, "tasks_root_from_config", lambda _cfg: object())
+    monkeypatch.setattr(runloop, "RunnerTelemetry", _Telemetry)
+    monkeypatch.setattr(runloop, "ensure_tasks_root", lambda _root: None)
+    monkeypatch.setattr(runloop, "ensure_pier", lambda: None)
+    monkeypatch.setattr(runloop, "_retry_pending_uploads", lambda _client: None)
+    monkeypatch.setattr(
+        runloop, "_resume_local_checkpoints",
+        lambda *_a, **_k: ([], True),  # every checkpoint lock was busy
+    )
+    monkeypatch.setattr(
+        runloop, "_go_menu",
+        lambda *_a, **_k: checked_out.append(True) or 0,
+    )
+    args = _args(
+        workers=1, auto=None, parallel=True, resume=True,
+        worker_child=worker_child,
+    )
+
+    assert runloop.cmd_go(args) == expected_rc
+    assert bool(checked_out) is expected_checkout
+    output = capsys.readouterr().out
+    if worker_child:
+        assert "checking for a different waiting task" in output
+
+
 class _Process:
     next_pid = 100
 
