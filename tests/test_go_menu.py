@@ -392,6 +392,42 @@ def test_get_assignment_403_passes_server_detail_through(monkeypatch, tmp_path: 
     assert "login --github" not in msg
 
 
+def test_terminal_local_upload_rejection_is_excluded_while_other_work_drains(
+        monkeypatch, tmp_path: Path):
+    first = dict(ASSIGNMENT)
+    second = {**ASSIGNMENT, "assignment_id": "a2", "task_id": "t2", "nonce": "n2"}
+    checkout_calls = []
+    ran = []
+
+    class AtomicClient:
+        second_sent = False
+
+        def checkout(self, exclude_assignment_ids=None):
+            excluded = set(exclude_assignment_ids or ())
+            checkout_calls.append(excluded)
+            if first["assignment_id"] not in excluded:
+                return {"assignment": first, "held": 2, "unstarted": 1}
+            if not self.second_sent:
+                self.second_sent = True
+                return {"assignment": second, "held": 2, "unstarted": 0}
+            return {"assignment": None, "held": 1, "unstarted": 0}
+
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        runloop, "_run_and_submit",
+        lambda _client, assignment, *_a, **_k: (
+            ran.append(assignment["assignment_id"])
+            or ("not-uploaded" if assignment["assignment_id"] == "a1" else "submitted")
+        ),
+    )
+    args = _args(yes=True)
+    assert runloop._run_checkout_loop(
+        args, AtomicClient(), tmp_path, [first, second],
+    ) == 1
+    assert ran == ["a1", "a2"]
+    assert checkout_calls[1] == {"a1"}
+
+
 def test_choose_menu_entry_numeric_pick(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda *_: "2")
     assert runloop._choose_menu_entry(MENU, yes=False) is MENU[1]

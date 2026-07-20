@@ -1,4 +1,7 @@
-from dradar.scrub import scan_secrets, scrub_bytes, scrub_text
+from dradar.scrub import (
+    patch_structure_is_valid, redact_patch_secrets, scan_secrets, scrub_bytes,
+    scrub_text,
+)
 
 
 def test_scrubs_openai_key():
@@ -46,3 +49,33 @@ def test_scan_secrets_detects_without_rewriting():
 def test_scan_secrets_clean_patch_passes():
     patch = b"diff --git a/x b/x\n@@ -1 +1 @@\n-old value\n+new value\n"
     assert scan_secrets(patch) == []
+
+
+def test_patch_redaction_only_rewrites_added_hunk_lines():
+    patch = b"""diff --git a/app.py b/app.py
+index 3367afd..f04ce62 100644
+--- a/app.py
++++ b/app.py
+@@ -1 +1,2 @@
+ old = True
++api_key = \"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456\"
+"""
+    redacted, labels, unsafe = redact_patch_secrets(patch)
+    assert "GHP" in labels and unsafe == []
+    assert b"ghp_" not in redacted
+    assert b'api_key = "[REDACTED-GHP]"' in redacted
+    assert scan_secrets(redacted) == []
+    assert patch_structure_is_valid(redacted)
+
+
+def test_patch_redaction_rejects_secret_in_context_line():
+    patch = b"""diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -1 +1,2 @@
+ ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456
++safe = True
+"""
+    redacted, labels, unsafe = redact_patch_secrets(patch)
+    assert labels == [] and "GHP" in unsafe
+    assert b"ghp_" in redacted

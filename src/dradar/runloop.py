@@ -31,7 +31,10 @@ from .runner import (
     diagnose_exception, ensure_pier, ensure_tasks_root, local_deep_swe_commit,
     run_trial, summarize_result, sync_deep_swe_commit, trial_artifact_paths,
 )
-from .scrub import scan_secrets, scrub_bytes, scrub_file
+from .scrub import (
+    patch_structure_is_valid, redact_patch_secrets, scan_secrets, scrub_bytes,
+    scrub_file,
+)
 from .telemetry import RunnerTelemetry
 
 
@@ -39,6 +42,7 @@ from .telemetry import RunnerTelemetry
 # count ceiling as a last-resort guard against corrupt estimates or a logic
 # regression; normal quota-bounded plans should never reach it.
 DEFAULT_REFILL_TASK_SAFETY_CAP = 1000
+_TERMINAL_LOCAL_OUTCOMES = {"artifacts-gone", "not-uploaded", "rejected"}
 
 
 def _fmt_pct(pct: float) -> str:
@@ -323,7 +327,16 @@ def _upload_trial(
     assignment_id = entry["assignment_id"]
     task_id = entry.get("task_id", "?")
     outcome = entry.get("outcome", "completed")
-    job_dir = Path(entry["job_dir"]) if entry.get("job_dir") else None
+    trial_dir = Path(entry["trial_dir"])
+    job_dir = Path(entry["job_dir"]) if entry.get("job_dir") else trial_dir.parent
+    jobs_root = (HOME / "work" / "jobs").resolve()
+    if not entry.get("job_dir"):
+        inferred = job_dir.resolve()
+        if inferred == jobs_root or jobs_root not in inferred.parents:
+            # Old ledgers may omit job_dir. Only infer it from the canonical
+            # jobs tree; never let a crafted trial_dir turn its parent into a
+            # cleanup target.
+            job_dir = None
 
     def cleanup_settled() -> None:
         # During an interactive completed run, keep the current directory
@@ -334,37 +347,44 @@ def _upload_trial(
             HOME, assignment_id, keep_job_dir=keep_dir,
         )
 
-    def discard_unusable_checkpoint(*, preserve_local: bool = False) -> None:
+    def settle_terminal_local_failure() -> None:
+        """Keep evidence but make a non-retryable local result runnable again."""
+        _mark_stopped_quietly(client, assignment_id)
         item = checkpoints.find_latest(HOME, assignment_id)
-        if item is None:
-            if preserve_local and job_dir and job_dir.is_dir():
-                (job_dir / checkpoints.KEEP_MARKER).touch(mode=0o600, exist_ok=True)
-            return
-        _discard_checkpoint_quietly(
-            client, item,
-            {"resume_generation": entry.get(
-                "resume_generation", item.resume_generation),
-             "checkpoint_id": item.checkpoint_id},
-            reason="invalid",
-            preserve_local=preserve_local,
-        )
+        if item is not None:
+            checkpoints.mark_terminal(HOME, item)
+        elif job_dir and job_dir.is_dir():
+            try:
+                checkpoints.mark_terminal_job(HOME, job_dir)
+            except ValueError:
+                pass
 
-    patch, trajectory, result = trial_artifact_paths(Path(entry["trial_dir"]))
+    patch, trajectory, result = trial_artifact_paths(trial_dir)
     if not patch.is_file():
         print(f"  {task_id}: local artifacts are gone, giving up on this one")
         pending.remove(HOME, assignment_id)
-        discard_unusable_checkpoint()
+        settle_terminal_local_failure()
         return "artifacts-gone"
 
-    leaked = scan_secrets(patch.read_bytes())
+    raw_patch = patch.read_bytes()
+    leaked = scan_secrets(raw_patch)
+    redacted_patch: bytes | None = None
+    redacted_labels: list[str] = []
     if leaked:
-        print(f"patch contains secret-shaped content ({', '.join(sorted(set(leaked)))}); "
-              f"not uploaded. Inspect {patch} and scrub before resubmitting.")
-        # Not retryable as-is (the patch itself needs manual attention) —
-        # don't leave a ledger entry that would just fail the same way forever.
-        pending.remove(HOME, assignment_id)
-        discard_unusable_checkpoint()
-        return "not-uploaded"
+        redacted_patch, redacted_labels, unsafe_labels = redact_patch_secrets(raw_patch)
+        still_leaked = scan_secrets(redacted_patch)
+        if (unsafe_labels or still_leaked
+                or not redacted_labels or not patch_structure_is_valid(redacted_patch)):
+            labels = sorted(set(unsafe_labels or still_leaked or leaked))
+            print(f"patch contains secret-shaped content ({', '.join(labels)}) "
+                  "outside safely redactable added lines, or redaction made the diff "
+                  f"invalid; not uploaded. Raw evidence kept at {patch}")
+            pending.remove(HOME, assignment_id)
+            settle_terminal_local_failure()
+            return "not-uploaded"
+        print(f"patch contained secret-shaped content "
+              f"({', '.join(redacted_labels)}); uploading a structurally validated "
+              "redacted copy. The raw patch stays local.")
 
     trajectory_bundle = build_codex_trajectory_bundle(Path(entry["trial_dir"]))
     usage = (codex_trajectory_bundle_usage(trajectory_bundle)
@@ -375,6 +395,9 @@ def _upload_trial(
         or usage.get("session_file_count", 0) > 1
     ))
     upload_meta = dict(entry.get("meta") or {})
+    if redacted_patch is not None:
+        upload_meta["patch_redacted"] = True
+        upload_meta["patch_redaction_labels"] = redacted_labels
     if multi_session:
         upload_meta["cost_usd"] = None
         upload_meta["usage_aggregation"] = usage["schema"]
@@ -388,6 +411,10 @@ def _upload_trial(
 
     with tempfile.TemporaryDirectory() as td:
         scrubbed = Path(td)
+        upload_patch = patch
+        if redacted_patch is not None:
+            upload_patch = scrubbed / "model.patch"
+            upload_patch.write_bytes(redacted_patch)
         trajectory_bundle_scrubbed = None
         if multi_session:
             trajectory_bundle_scrubbed = scrubbed / "trajectory_bundle.json"
@@ -435,7 +462,7 @@ def _upload_trial(
             if trajectory_bundle_scrubbed is not None:
                 submit_kwargs["trajectory_bundle"] = trajectory_bundle_scrubbed
             ack = client.submit(
-                assignment_id, entry["nonce"], patch, traj_scrubbed,
+                assignment_id, entry["nonce"], upload_patch, traj_scrubbed,
                 result_scrubbed, upload_meta, **submit_kwargs,
             )
         except ApiError as exc:
@@ -464,7 +491,7 @@ def _upload_trial(
                       "retrying can't fix it, dropping it from the retry queue "
                       f"(local artifact path: {patch.parent.parent})")
                 pending.remove(HOME, assignment_id)
-                discard_unusable_checkpoint(preserve_local=True)
+                settle_terminal_local_failure()
                 print(f"  rejected artifacts kept for diagnosis: {patch.parent.parent}")
                 return "rejected"
             print(f"  {task_id}: upload failed ({exc}) — kept for retry "
@@ -510,9 +537,12 @@ def _upload_trial(
     return "interrupted" if outcome == "interrupted" else "submitted"
 
 
-def _mark_stopped_quietly(client: ApiClient, assignment: dict) -> None:
+def _mark_stopped_quietly(client: ApiClient, assignment: dict | str) -> None:
     try:
-        client.mark_stopped(assignment["assignment_id"])
+        assignment_id = (
+            assignment if isinstance(assignment, str) else assignment["assignment_id"]
+        )
+        client.mark_stopped(assignment_id)
     except Exception:
         pass
 
@@ -960,7 +990,10 @@ def cmd_checkpoints(args) -> int:
     for item in items:
         size = item.size_bytes
         total += size
-        state = item.phase if item.valid else f"invalid ({item.invalid_reason})"
+        if checkpoints.is_terminal(HOME, item):
+            state = "terminal evidence (not resumable)"
+        else:
+            state = item.phase if item.valid else f"invalid ({item.invalid_reason})"
         print(f"{item.checkpoint_id or '?'}  assignment={item.assignment_id or '?'}  "
               f"task={item.task_id or '?'}  state={state}  size={_format_size(size)}  "
               f"updated={item.updated_at.isoformat()}")
@@ -977,6 +1010,14 @@ def cmd_checkpoint_discard(args) -> int:
     if not matches:
         print(f"checkpoint not found: {args.checkpoint_id}")
         return 1
+    terminal = [item for item in matches if checkpoints.is_terminal(HOME, item)]
+    resumable = [item for item in matches if not checkpoints.is_terminal(HOME, item)]
+    for item in terminal:
+        checkpoints.remove(HOME, item)
+    matches = resumable
+    if not matches:
+        print("terminal local evidence removed; server lease left unchanged")
+        return 0
     cfg = _load_config()
     client = _client(cfg)
     try:
@@ -1590,7 +1631,7 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                   "the shared agent/network issue before resuming")
             results.append(outcome)
             break
-        if outcome == "failed":
+        if outcome == "failed" or outcome in _TERMINAL_LOCAL_OUTCOMES:
             failed_ids.add(assignment["assignment_id"])
         results.append(outcome)
     ok = all(o in ("submitted", "interrupted") for o in results)

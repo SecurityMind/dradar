@@ -20,6 +20,7 @@ from typing import Iterator
 SCHEMA_VERSION = 1
 DEFAULT_TTL_DAYS = 7
 KEEP_MARKER = ".dradar-keep"
+TERMINAL_MARKER = ".dradar-terminal-evidence"
 _SENSITIVE_KEY_PARTS = ("token", "secret", "password", "credential", "api_key", "auth")
 _ASSIGNMENT_FROM_JOB = re.compile(r"^a([0-9a-f]{32})(?:-|$)")
 
@@ -164,12 +165,32 @@ def scan(home: Path) -> list[Checkpoint]:
             found.append(_load(path))
         except (OSError, IndexError):
             continue
+    seen_jobs = {item.job_dir.resolve() for item in found}
+    for marker in root.glob(f"*/{TERMINAL_MARKER}"):
+        try:
+            job_dir = marker.parent
+            if job_dir.resolve() in seen_jobs:
+                continue
+            trials = sorted(path for path in job_dir.glob("*__*") if path.is_dir())
+            trial_dir = trials[0] if trials else job_dir
+            updated_at = datetime.fromtimestamp(marker.stat().st_mtime, timezone.utc)
+            found.append(Checkpoint(
+                marker, marker.parent, trial_dir, job_dir,
+                _infer_assignment_id(job_dir), None, "terminal", 0,
+                None, None, None, updated_at,
+                False, "terminal local evidence",
+            ))
+        except OSError:
+            # A concurrent cleanup may remove the marker between glob/stat.
+            continue
     return sorted(found, key=lambda item: item.updated_at, reverse=True)
 
 
 def latest_by_assignment(home: Path) -> dict[str, Checkpoint]:
     latest: dict[str, Checkpoint] = {}
     for item in scan(home):
+        if is_terminal(home, item):
+            continue
         if item.assignment_id and item.assignment_id not in latest:
             latest[item.assignment_id] = item
     return latest
@@ -195,6 +216,24 @@ def mark_kept(home: Path, item: Checkpoint) -> None:
     """Protect a settled job from the default ``dradar cleanup`` sweep."""
     marker = _safe_job_dir(home, item) / KEEP_MARKER
     marker.touch(mode=0o600, exist_ok=True)
+
+
+def mark_terminal(home: Path, item: Checkpoint) -> None:
+    """Keep diagnostics locally while excluding this item from recovery."""
+    mark_terminal_job(home, _safe_job_dir(home, item))
+
+
+def mark_terminal_job(home: Path, job_dir: Path) -> None:
+    root = (home / "work" / "jobs").resolve()
+    job_dir = job_dir.resolve()
+    if job_dir == root or root not in job_dir.parents:
+        raise ValueError(f"job path escaped jobs directory: {job_dir}")
+    (job_dir / KEEP_MARKER).touch(mode=0o600, exist_ok=True)
+    (job_dir / TERMINAL_MARKER).touch(mode=0o600, exist_ok=True)
+
+
+def is_terminal(home: Path, item: Checkpoint) -> bool:
+    return (_safe_job_dir(home, item) / TERMINAL_MARKER).is_file()
 
 
 def is_kept(home: Path, item: Checkpoint) -> bool:
