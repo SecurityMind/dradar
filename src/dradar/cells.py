@@ -79,10 +79,45 @@ def _filter_rows(rows: list[dict[str, Any]], args) -> list[dict[str, Any]]:
             continue
         if args.max_tests is not None and (tests is None or tests > args.max_tests):
             continue
+        minutes = row.get("min")
+        if (getattr(args, "min_minutes", None) is not None and
+                (minutes is None or minutes < args.min_minutes)):
+            continue
+        if (getattr(args, "max_minutes", None) is not None and
+                (minutes is None or minutes > args.max_minutes)):
+            continue
+        cost = row.get("cost")
+        if (getattr(args, "min_cost", None) is not None and
+                (cost is None or cost < args.min_cost)):
+            continue
+        if (getattr(args, "max_cost", None) is not None and
+                (cost is None or cost > args.max_cost)):
+            continue
+        rate = row.get("rate")
+        if (getattr(args, "min_pass_rate", None) is not None and
+                (rate is None or rate < args.min_pass_rate)):
+            continue
+        if (getattr(args, "max_pass_rate", None) is not None and
+                (rate is None or rate > args.max_pass_rate)):
+            continue
         if args.min_priority is not None and priority < args.min_priority:
             continue
         filtered.append(row)
     return filtered
+
+
+def _validate_ranges(args) -> None:
+    ranges = (
+        ("min-minutes", "max-minutes", getattr(args, "min_minutes", None),
+         getattr(args, "max_minutes", None)),
+        ("min-cost", "max-cost", getattr(args, "min_cost", None),
+         getattr(args, "max_cost", None)),
+        ("min-pass-rate", "max-pass-rate", getattr(args, "min_pass_rate", None),
+         getattr(args, "max_pass_rate", None)),
+    )
+    for low_name, high_name, low, high in ranges:
+        if low is not None and high is not None and low > high:
+            sys.exit(f"--{low_name} cannot be greater than --{high_name}")
 
 
 def _validate_priority_support(rows: list[dict[str, Any]], args) -> bool:
@@ -178,6 +213,7 @@ def cmd_cells(args) -> int:
 
     all_rows = _rows(table)
     priority_available = _validate_priority_support(all_rows, args)
+    _validate_ranges(args)
     rows = _filter_rows(all_rows, args)
     _sort_rows(rows, args.sort, args.reverse)
     matched = len(rows)

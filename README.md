@@ -190,6 +190,7 @@ dradar cells --model gpt-5.5 --max-tests 2 --sort tests --reverse
 dradar cells --state cooldown --task cache --sort minutes
 dradar cells --available --format pick
 dradar cells --available --all --json
+dradar cells --available --max-minutes 15 --max-cost 2 --min-pass-rate 0.5
 ```
 
 ### 格子状态
@@ -228,6 +229,9 @@ dradar cells --available --all --json
 | `--task TEXT` | 任务 ID 包含指定文本，不区分大小写 |
 | `--min-multiplier X` | 最低积分倍率 |
 | `--min-tests N` / `--max-tests N` | 历史测试数范围 |
+| `--min-minutes N` / `--max-minutes N` | 预计运行分钟数范围；没有估时的数据不匹配 |
+| `--min-cost USD` / `--max-cost USD` | 预计模型成本范围（美元）；没有成本估算的数据不匹配 |
+| `--min-pass-rate RATE` / `--max-pass-rate RATE` | 历史通过率范围，取值 0–1（例如 `0.5` 表示 50%）；没有通过率的数据不匹配 |
 | `--min-priority N` | 最低推荐优先级；服务端没有发布该数据时明确报错 |
 | `--sort FIELD` | `multiplier`、`tests`、`pass-rate`、`minutes`、`cost`、`priority`、`task`、`model`、`effort` 或 `state` |
 | `--reverse` | 反转默认排序方向 |

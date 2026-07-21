@@ -40,6 +40,8 @@ def _args(**overrides):
     values = dict(
         model=None, effort=None, available=False, state=None, task=None,
         min_multiplier=None, min_tests=None, max_tests=None, min_priority=None,
+        min_minutes=None, max_minutes=None, min_cost=None, max_cost=None,
+        min_pass_rate=None, max_pass_rate=None,
         sort="multiplier", reverse=False, limit=20, all=False, json=True,
         format="table",
     )
@@ -74,6 +76,25 @@ def test_cells_numeric_filters_and_multiplier_sort(monkeypatch, capsys):
     assert [row["task_id"] for row in result["cells"]] == [
         "gamma-task", "alpha-task",
     ]
+
+
+def test_cells_resource_and_pass_rate_ranges_exclude_unknown_values(
+        monkeypatch, capsys):
+    result = _run(
+        monkeypatch, capsys,
+        min_minutes=5, max_minutes=15,
+        min_cost=1, max_cost=2,
+        min_pass_rate=0.5, max_pass_rate=0.8,
+    )
+    assert [row["task_id"] for row in result["cells"]] == ["alpha-task"]
+
+
+def test_cells_rejects_inverted_resource_ranges(monkeypatch, capsys):
+    with pytest.raises(SystemExit, match="--min-minutes cannot be greater"):
+        _run(monkeypatch, capsys, min_minutes=20, max_minutes=10)
+
+    with pytest.raises(SystemExit, match="--min-pass-rate cannot be greater"):
+        _run(monkeypatch, capsys, min_pass_rate=0.9, max_pass_rate=0.5)
 
 
 def test_cells_missing_sort_values_stay_last_when_reversed(monkeypatch, capsys):
