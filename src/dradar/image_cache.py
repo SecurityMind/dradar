@@ -1,0 +1,649 @@
+"""Safe lifecycle management for Docker images created by DRadar/Pier.
+
+Pier's compose projects build task-specific images.  A normal ``compose
+down`` can leave those tagged images behind, and high-throughput volunteers
+quickly accumulate hundreds of gigabytes.  This module deliberately does not
+use Docker's global prune commands: it records exact image references/IDs for
+new DRadar trials and re-validates Compose ownership labels immediately before
+removal.
+
+Legacy Pier images can be discovered, but are never adopted by automatic GC;
+they require the explicit ``cleanup --docker --all-task-images`` path.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterator
+
+
+SCHEMA_VERSION = 1
+LEDGER_NAME = "image-cache.json"
+LOCK_NAME = "image-cache.lock"
+GIB = 1024 ** 3
+DEFAULT_MIN_FREE_GIB = 25.0
+_PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9-]*__[a-z0-9]{6,8}$")
+_VALID_SERVICES = {"main", "pier-egress-proxy"}
+
+
+class DockerUnavailable(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class DockerImage:
+    reference: str
+    image_id: str
+    project: str
+    service: str
+    unique_size: int
+    containers: int
+    created_at: str
+
+
+@dataclass(frozen=True)
+class CachePolicy:
+    mode: str
+    limit_bytes: int
+    target_bytes: int
+    min_free_bytes: int
+    automatic: bool
+
+
+@dataclass
+class CleanupPlan:
+    candidates: list[DockerImage]
+    owned_references: set[str]
+    protected: int
+    estimated_reclaimable: int
+    total_owned_bytes: int
+    docker_available: bool = True
+    note: str | None = None
+    legacy_count: int = 0
+    legacy_bytes: int = 0
+
+
+@dataclass
+class MaintenanceResult:
+    removed: int = 0
+    estimated_reclaimed: int = 0
+    cache_bytes: int = 0
+    limit_bytes: int = 0
+    disk_free_bytes: int = 0
+    allow_new_claims: bool = True
+    note: str | None = None
+    legacy_count: int = 0
+    legacy_bytes: int = 0
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _sanitize_project(name: str) -> str:
+    value = name.lower()
+    if not re.match(r"^[a-z0-9]", value):
+        value = "0" + value
+    return re.sub(r"[^a-z0-9_-]", "-", value)
+
+
+def _parse_size(value: object) -> int:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return max(0, int(value))
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(-?[0-9.]+(?:e[+-]?[0-9]+)?)\s*([kmgt]?b)", text, re.I)
+    if not match:
+        return 0
+    number = float(match.group(1))
+    if number <= 0:
+        return 0
+    scale = {"b": 1, "kb": 1000, "mb": 1000 ** 2,
+             "gb": 1000 ** 3, "tb": 1000 ** 4}[match.group(2).lower()]
+    return int(number * scale)
+
+
+def _run_docker(command: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess:
+    docker = shutil.which("docker")
+    if not docker:
+        raise DockerUnavailable("Docker CLI not found")
+    try:
+        proc = subprocess.run(
+            [docker, *command], capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DockerUnavailable(f"couldn't query Docker: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "Docker command failed").strip()
+        raise DockerUnavailable(detail[:500])
+    return proc
+
+
+def _df_images() -> list[dict]:
+    proc = _run_docker(["system", "df", "-v", "--format", "{{json .}}"], timeout=120)
+    for line in proc.stdout.splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("Images"), list):
+            return [item for item in payload["Images"] if isinstance(item, dict)]
+    raise DockerUnavailable("Docker returned no readable image inventory")
+
+
+def _inspect(references: list[str]) -> dict[str, dict]:
+    """Inspect references in bounded chunks and map every current RepoTag."""
+    found: dict[str, dict] = {}
+    for start in range(0, len(references), 80):
+        chunk = references[start:start + 80]
+        if not chunk:
+            continue
+        proc = _run_docker(["image", "inspect", *chunk], timeout=120)
+        try:
+            values = json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            raise DockerUnavailable("Docker returned malformed image metadata") from exc
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            for tag in value.get("RepoTags") or []:
+                if isinstance(tag, str):
+                    found[tag] = value
+    return found
+
+
+def _inventory_rows() -> dict[str, dict]:
+    rows: dict[str, dict] = {}
+    for raw in _df_images():
+        repository, tag = raw.get("Repository"), raw.get("Tag")
+        if not repository or repository == "<none>" or not tag or tag == "<none>":
+            continue
+        rows[f"{repository}:{tag}"] = raw
+    return rows
+
+
+def _validated_image(reference: str, raw: dict, inspected: dict) -> DockerImage | None:
+    config = inspected.get("Config") or {}
+    labels = config.get("Labels") or {}
+    project = labels.get("com.docker.compose.project")
+    service = labels.get("com.docker.compose.service")
+    if not isinstance(project, str) or not _PROJECT_RE.fullmatch(project):
+        return None
+    if service not in _VALID_SERVICES:
+        return None
+    if reference != f"{project}-{service}:latest":
+        return None
+    image_id = inspected.get("Id") or raw.get("ID")
+    if not isinstance(image_id, str) or not image_id.startswith("sha256:"):
+        return None
+    try:
+        containers = int(raw.get("Containers") or 0)
+    except (TypeError, ValueError):
+        containers = 0
+    return DockerImage(
+        reference=reference,
+        image_id=image_id,
+        project=project,
+        service=service,
+        unique_size=_parse_size(raw.get("UniqueSize") or raw.get("Size")),
+        containers=max(0, containers),
+        created_at=str(raw.get("CreatedAt") or inspected.get("Created") or ""),
+    )
+
+
+def discover_pier_images() -> dict[str, DockerImage]:
+    """Return only images whose current tag and Compose labels agree."""
+    rows = _inventory_rows()
+    possible = [ref for ref in rows if any(
+        ref.endswith(f"-{service}:latest") for service in _VALID_SERVICES
+    )]
+    inspected = _inspect(possible)
+    result: dict[str, DockerImage] = {}
+    for reference in possible:
+        value = inspected.get(reference)
+        if value is None:
+            continue
+        image = _validated_image(reference, rows[reference], value)
+        if image is not None:
+            result[reference] = image
+    return result
+
+
+@contextmanager
+def _ledger_lock(home: Path) -> Iterator[None]:
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / LOCK_NAME
+    fh = open(path, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"\0")
+                fh.flush()
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
+def _load_unlocked(home: Path) -> dict[str, dict]:
+    path = home / LEDGER_NAME
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
+        return {}
+    records = payload.get("images")
+    if not isinstance(records, dict):
+        return {}
+    return {str(key): value for key, value in records.items() if isinstance(value, dict)}
+
+
+def load(home: Path) -> dict[str, dict]:
+    with _ledger_lock(home):
+        return _load_unlocked(home)
+
+
+def _save_unlocked(home: Path, records: dict[str, dict]) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / LEDGER_NAME
+    tmp = path.with_suffix(".json.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"schema_version": SCHEMA_VERSION, "images": records}, fh, indent=2)
+        fh.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def record_trial_images(
+    home: Path, *, assignment_id: str, task_id: str, trial_name: str,
+) -> int:
+    """Record exact, label-validated images left by one completed Pier run."""
+    project = _sanitize_project(trial_name)
+    if not _PROJECT_RE.fullmatch(project):
+        return 0
+    expected = [f"{project}-main:latest", f"{project}-pier-egress-proxy:latest"]
+    images = []
+    for reference in expected:
+        try:
+            proc = _run_docker(["image", "inspect", reference], timeout=30)
+            values = json.loads(proc.stdout)
+        except (DockerUnavailable, json.JSONDecodeError):
+            continue
+        if not isinstance(values, list) or not values or not isinstance(values[0], dict):
+            continue
+        inspected = values[0]
+        raw = {
+            "ID": inspected.get("Id"),
+            "UniqueSize": inspected.get("Size"),
+            "Containers": 0,
+            "CreatedAt": inspected.get("Created"),
+        }
+        image = _validated_image(reference, raw, inspected)
+        if image is not None:
+            images.append(image)
+    if not images:
+        return 0
+    timestamp = _now()
+    with _ledger_lock(home):
+        records = _load_unlocked(home)
+        for image in images:
+            records[image.reference] = {
+                "image_id": image.image_id,
+                "project": image.project,
+                "service": image.service,
+                "assignment_id": assignment_id,
+                "task_id": task_id,
+                "last_used_at": timestamp,
+            }
+        _save_unlocked(home, records)
+    return len(images)
+
+
+def effective_policy(home: Path, cfg: dict) -> CachePolicy:
+    mode = cfg.get("image_cache_mode", "balanced")
+    if mode not in {"balanced", "metered", "disk"}:
+        mode = "balanced"
+    try:
+        usage = shutil.disk_usage(home)
+    except OSError:
+        usage = shutil.disk_usage(Path.home())
+    configured = cfg.get("image_cache_limit_gb")
+    try:
+        configured_gib = float(configured) if configured is not None else None
+    except (TypeError, ValueError):
+        configured_gib = None
+    if configured_gib is not None and configured_gib > 0:
+        limit = int(configured_gib * GIB)
+    elif mode == "disk":
+        limit = int(min(20, max(10, usage.total / GIB * 0.02)) * GIB)
+    elif mode == "metered":
+        limit = int(min(100, max(40, usage.total / GIB * 0.10)) * GIB)
+    else:
+        limit = int(min(50, max(20, usage.total / GIB * 0.05)) * GIB)
+    target = int(limit * 0.75)
+    return CachePolicy(
+        mode=mode,
+        limit_bytes=limit,
+        target_bytes=target,
+        min_free_bytes=int(DEFAULT_MIN_FREE_GIB * GIB),
+        automatic=mode != "metered",
+    )
+
+
+def _protected_projects(home: Path, protected_assignment_ids: set[str],
+                        include_kept: bool) -> set[str]:
+    from . import checkpoints, pending
+
+    projects: set[str] = set()
+    pending_entries = pending.load(home)
+    pending_ids = {str(item.get("assignment_id")) for item in pending_entries
+                   if item.get("assignment_id")}
+    for entry in pending_entries:
+        trial_dir = entry.get("trial_dir")
+        if trial_dir:
+            projects.add(_sanitize_project(Path(trial_dir).name))
+    for item in checkpoints.scan(home):
+        protected = (
+            item.assignment_id in protected_assignment_ids
+            or item.assignment_id in pending_ids
+            or (checkpoints.is_kept(home, item) and not include_kept)
+        )
+        if protected:
+            projects.add(_sanitize_project(item.trial_dir.name))
+    # Legacy jobs may predate checkpoint manifests or the image ledger. Their
+    # directory still carries the assignment ID (a<32 hex>) and trial/project
+    # name, so preserve that final recovery signal as well.
+    jobs_root = home / "work" / "jobs"
+    if jobs_root.is_dir():
+        for job_dir in jobs_root.iterdir():
+            if not job_dir.is_dir():
+                continue
+            job_name = job_dir.name
+            assignment_id = None
+            if job_name.startswith("a") and len(job_name) >= 33:
+                candidate = job_name[1:33]
+                if re.fullmatch(r"[0-9a-f]{32}", candidate):
+                    assignment_id = candidate
+            protect_job = (
+                assignment_id in protected_assignment_ids
+                or (job_dir / ".dradar-keep").is_file() and not include_kept
+            )
+            if protect_job:
+                for trial_dir in job_dir.glob("*__*"):
+                    if trial_dir.is_dir():
+                        projects.add(_sanitize_project(trial_dir.name))
+    return projects
+
+
+def _estimate(images: list[DockerImage]) -> int:
+    # Several compose tags can point at the same content-addressed image.
+    # Count each image ID once; the number remains an estimate because Docker
+    # may retain shared layers for unrelated tags/build cache.
+    by_id: dict[str, int] = {}
+    for image in images:
+        by_id[image.image_id] = max(by_id.get(image.image_id, 0), image.unique_size)
+    return sum(by_id.values())
+
+
+def plan_cleanup(
+    home: Path, *, protected_assignment_ids: set[str], include_kept: bool = False,
+    include_legacy: bool = False,
+) -> CleanupPlan:
+    records = load(home)
+    try:
+        images = discover_pier_images()
+    except DockerUnavailable as exc:
+        return CleanupPlan([], set(records), 0, 0, 0, False, str(exc))
+    protected_projects = _protected_projects(
+        home, protected_assignment_ids, include_kept,
+    )
+    pending_ids = set()
+    from . import pending
+    for entry in pending.load(home):
+        if entry.get("assignment_id"):
+            pending_ids.add(str(entry["assignment_id"]))
+    protected_ids = protected_assignment_ids | pending_ids
+    candidates: list[DockerImage] = []
+    protected = 0
+    stale_records: list[str] = []
+    owned_current: set[str] = set()
+    for reference, record in records.items():
+        image = images.get(reference)
+        if image is None or image.image_id != record.get("image_id"):
+            stale_records.append(reference)
+            continue
+        owned_current.add(reference)
+        if (record.get("assignment_id") in protected_ids
+                or image.project in protected_projects or image.containers > 0):
+            protected += 1
+            continue
+        candidates.append(image)
+    if stale_records:
+        with _ledger_lock(home):
+            latest = _load_unlocked(home)
+            for reference in stale_records:
+                latest.pop(reference, None)
+            _save_unlocked(home, latest)
+    legacy_images = [
+        image for reference, image in images.items() if reference not in owned_current
+    ]
+    if include_legacy:
+        for image in legacy_images:
+            if image.project in protected_projects or image.containers > 0:
+                protected += 1
+                continue
+            candidates.append(image)
+    total_owned = _estimate([
+        image for reference, image in images.items() if reference in owned_current
+    ])
+    candidates.sort(key=lambda image: (
+        str(records.get(image.reference, {}).get("last_used_at") or image.created_at),
+        image.reference,
+    ))
+    return CleanupPlan(
+        candidates=candidates,
+        owned_references=owned_current,
+        protected=protected,
+        estimated_reclaimable=_estimate(candidates),
+        total_owned_bytes=total_owned,
+        legacy_count=len(legacy_images),
+        legacy_bytes=_estimate(legacy_images),
+    )
+
+
+def _remove_one(image: DockerImage) -> bool:
+    """Revalidate tag, ID, labels and zero-container state, then untag."""
+    try:
+        rows = _inventory_rows()
+        raw = rows.get(image.reference)
+        if raw is None:
+            return True
+        inspected = _inspect([image.reference]).get(image.reference)
+        if inspected is None:
+            return False
+        current = _validated_image(image.reference, raw, inspected)
+        if current is None or current.image_id != image.image_id or current.containers > 0:
+            return False
+        _run_docker(["image", "rm", image.reference], timeout=180)
+        return True
+    except DockerUnavailable:
+        return False
+
+
+def remove_images(home: Path, images: list[DockerImage]) -> tuple[int, int]:
+    removed = 0
+    removed_images: list[DockerImage] = []
+    for image in images:
+        if _remove_one(image):
+            removed += 1
+            removed_images.append(image)
+    if removed_images:
+        with _ledger_lock(home):
+            records = _load_unlocked(home)
+            for image in removed_images:
+                if records.get(image.reference, {}).get("image_id") == image.image_id:
+                    records.pop(image.reference, None)
+            _save_unlocked(home, records)
+    return removed, _estimate(removed_images)
+
+
+def automatic_maintenance(
+    home: Path, cfg: dict, *, protected_assignment_ids: set[str],
+) -> MaintenanceResult:
+    policy = effective_policy(home, cfg)
+    disk_known = True
+    try:
+        disk_free = shutil.disk_usage(home).free
+    except OSError:
+        # An unreadable filesystem statistic is not proof of low space.  Keep
+        # cleanup disabled and let the normal runner surface any real write
+        # failure instead of blocking the user on an unknown value.
+        disk_known = False
+        disk_free = policy.min_free_bytes
+    plan = plan_cleanup(
+        home, protected_assignment_ids=protected_assignment_ids,
+        include_kept=False, include_legacy=False,
+    )
+    result = MaintenanceResult(
+        cache_bytes=plan.total_owned_bytes,
+        limit_bytes=policy.limit_bytes,
+        disk_free_bytes=disk_free,
+        legacy_count=plan.legacy_count,
+        legacy_bytes=plan.legacy_bytes,
+    )
+    if not plan.docker_available:
+        result.note = plan.note
+        result.allow_new_claims = (
+            not disk_known or disk_free >= policy.min_free_bytes
+        )
+        if not result.allow_new_claims:
+            result.note = (
+                f"{plan.note}; disk space is below the 25 GiB safety floor, "
+                "so no new task will be claimed"
+            )
+        return result
+    pressure = disk_free < policy.min_free_bytes
+    over_limit = plan.total_owned_bytes > policy.limit_bytes
+    if not pressure and not over_limit:
+        return result
+    if not policy.automatic:
+        result.allow_new_claims = not pressure
+        result.note = (
+            "metered image-cache mode preserved Docker images; "
+            "run `dradar cleanup --docker --dry-run` before claiming more"
+        )
+        return result
+    goal = policy.target_bytes if over_limit else 0
+    chosen: list[DockerImage] = []
+    remaining = plan.total_owned_bytes
+    reclaimed_ids: set[str] = set()
+    needed_for_disk = max(0, policy.min_free_bytes - disk_free)
+    estimated = 0
+    for image in plan.candidates:
+        if remaining <= goal and estimated >= needed_for_disk:
+            break
+        chosen.append(image)
+        if image.image_id not in reclaimed_ids:
+            reclaimed_ids.add(image.image_id)
+            estimated += image.unique_size
+            remaining = max(0, remaining - image.unique_size)
+    removed, reclaimed = remove_images(home, chosen)
+    result.removed = removed
+    result.estimated_reclaimed = reclaimed
+    result.cache_bytes = max(0, plan.total_owned_bytes - reclaimed)
+    try:
+        result.disk_free_bytes = shutil.disk_usage(home).free
+    except OSError:
+        pass
+    result.allow_new_claims = result.disk_free_bytes >= policy.min_free_bytes
+    if pressure and not result.allow_new_claims:
+        result.note = (
+            "disk space is still below the 25 GiB safety floor; no new task "
+            "will be claimed"
+        )
+    return result
+
+
+def proxy_detected() -> bool:
+    return any(os.environ.get(name) for name in (
+        "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy",
+    ))
+
+
+def cmd_config_show(args) -> int:
+    from . import local_config
+
+    cfg = local_config._load_config()
+    policy = effective_policy(local_config.HOME, cfg)
+    configured = cfg.get("image_cache_limit_gb")
+    source = "configured" if configured is not None else "automatic"
+    print("local image-cache settings (credentials are never displayed):")
+    print(f"  mode: {policy.mode}")
+    print(f"  limit: {policy.limit_bytes / GIB:.1f} GiB ({source})")
+    print(f"  cleanup target: {policy.target_bytes / GIB:.1f} GiB")
+    print(f"  minimum free disk: {policy.min_free_bytes / GIB:.0f} GiB")
+    print(f"  proxy environment detected: {'yes' if proxy_detected() else 'no'}")
+    return 0
+
+
+def cmd_config_set(args) -> int:
+    from . import local_config
+
+    cfg = local_config._load_config()
+    if args.key == "image-cache-mode":
+        value = args.value.strip().lower()
+        if value not in {"balanced", "metered", "disk"}:
+            raise SystemExit("image-cache-mode must be balanced, metered, or disk")
+        cfg["image_cache_mode"] = value
+        shown = value
+    else:
+        value = args.value.strip().lower()
+        if value == "auto":
+            cfg.pop("image_cache_limit_gb", None)
+            shown = "automatic"
+        else:
+            try:
+                limit = float(value)
+            except ValueError as exc:
+                raise SystemExit("image-cache-limit-gb must be a positive number or auto") from exc
+            if limit <= 0:
+                raise SystemExit("image-cache-limit-gb must be greater than zero")
+            cfg["image_cache_limit_gb"] = limit
+            shown = f"{limit:g} GiB"
+    local_config._save_config(cfg)
+    print(f"saved {args.key}={shown}")
+    return 0
+
+
+__all__ = [
+    "CachePolicy", "CleanupPlan", "DockerImage", "DockerUnavailable",
+    "MaintenanceResult", "automatic_maintenance", "discover_pier_images",
+    "effective_policy", "load", "plan_cleanup", "proxy_detected",
+    "record_trial_images", "remove_images", "cmd_config_set", "cmd_config_show",
+]

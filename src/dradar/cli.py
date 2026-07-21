@@ -23,6 +23,7 @@ from .capacity import cmd_capacity
 from .cells import cmd_cells
 from .doctor import cmd_doctor
 from .identity import cmd_link_github, cmd_login, cmd_rename, cmd_status
+from .image_cache import cmd_config_set, cmd_config_show
 from .leases import cmd_leases, cmd_release
 from .runloop import (
     cmd_checkpoint_discard, cmd_checkpoints, cmd_cleanup, cmd_go,
@@ -148,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     p_retry.set_defaults(func=cmd_retry_upload, lease_hint=True)
 
     p_cleanup = sub.add_parser(
-        "cleanup", help="safely remove settled local task files")
+        "cleanup", help="safely remove settled local task files and DRadar images")
     p_cleanup.add_argument(
         "--dry-run", action="store_true",
         help="show what can be removed without deleting anything",
@@ -157,8 +158,27 @@ def main(argv: list[str] | None = None) -> int:
         "--include-kept", action="store_true",
         help="also remove task files explicitly protected by --keep",
     )
+    p_cleanup.add_argument(
+        "--docker", action="store_true",
+        help="also remove safe image-cache entries recorded by DRadar",
+    )
+    p_cleanup.add_argument(
+        "--all-task-images", action="store_true",
+        help="with --docker, also include legacy label-validated Pier task images",
+    )
     p_cleanup.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
     p_cleanup.set_defaults(func=cmd_cleanup)
+
+    p_config = sub.add_parser("config", help="inspect or change local DRadar settings")
+    config_sub = p_config.add_subparsers(dest="config_command", required=True)
+    p_config_show = config_sub.add_parser("show", help="show non-sensitive local settings")
+    p_config_show.set_defaults(func=cmd_config_show)
+    p_config_set = config_sub.add_parser("set", help="change a supported local setting")
+    p_config_set.add_argument(
+        "key", choices=("image-cache-mode", "image-cache-limit-gb"),
+    )
+    p_config_set.add_argument("value")
+    p_config_set.set_defaults(func=cmd_config_set)
 
     p_refill = sub.add_parser("refill", help="inspect or stop continuous auto-refill")
     refill_sub = p_refill.add_subparsers(dest="refill_command", required=True)
