@@ -20,7 +20,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import __version__, checkpoints, pending, refill as refill_plan
+from . import __version__, checkpoints, image_cache, pending, refill as refill_plan
 from .api_client import ApiClient, ApiError
 from .identity import _client
 from .local_config import HOME, _load_config, tasks_root_from_config
@@ -695,6 +695,17 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             _pause_checkpoint_quietly(client, assignment)
             raise
 
+    # Pier normally removes compose images on a clean stop, but Docker/Pier
+    # failures in the wild leave the task image tagged. Record only exact
+    # label-validated references now, before upload cleanup removes job_dir.
+    # This is best-effort bookkeeping and must never invalidate real work.
+    image_cache.record_trial_images(
+        HOME,
+        assignment_id=assignment["assignment_id"],
+        task_id=assignment["task_id"],
+        trial_name=art.trial_dir.name,
+    )
+
     stats = summarize_result(art.result)
     # An interrupted/failed run (nonzero pier rc or recorded exception) is not a
     # model failure: report it so the server marks it invalid, not graded 0.
@@ -1076,12 +1087,18 @@ def cmd_refill_stop(args) -> int:
 
 
 def cmd_cleanup(args) -> int:
-    """Remove only local jobs proven safe by current server state.
+    """Remove only local jobs/images proven safe by current server state.
 
     A network failure aborts the whole sweep: without an authoritative active
     lease list, an ``agent_completed`` checkpoint may be a finished trial that
     crashed immediately before its upload ledger was recorded.
     """
+    docker_requested = bool(
+        getattr(args, "docker", False) or getattr(args, "all_task_images", False)
+    )
+    if getattr(args, "all_task_images", False) and not getattr(args, "docker", False):
+        print("--all-task-images requires --docker")
+        return 1
     cfg = _load_config()
     client = _client(cfg)
     try:
@@ -1116,7 +1133,10 @@ def cmd_cleanup(args) -> int:
 
     total = sum(item.size_bytes for item in candidates)
     if not candidates:
-        print("nothing safe to clean")
+        if docker_requested:
+            print("local task files: nothing safe to clean")
+        else:
+            print("nothing safe to clean")
     else:
         action = "would remove" if args.dry_run else "ready to remove"
         print(f"{action} {len(candidates)} settled local task(s), {_format_size(total)}")
@@ -1130,17 +1150,101 @@ def cmd_cleanup(args) -> int:
               f"{protected_active} active/resumable, "
               f"{protected_pending} pending upload, "
               f"{protected_kept} explicitly kept")
-    if not candidates or args.dry_run:
-        return 0
+
+    image_plan = None
+    if docker_requested:
+        image_plan = image_cache.plan_cleanup(
+            HOME,
+            protected_assignment_ids=active_ids,
+            include_kept=args.include_kept,
+            include_legacy=getattr(args, "all_task_images", False),
+        )
+        print("Docker task images:")
+        if not image_plan.docker_available:
+            print(f"  couldn't inspect Docker safely: {image_plan.note}")
+        elif not image_plan.candidates:
+            print("  nothing safe to clean")
+        else:
+            qualifier = "would remove" if args.dry_run else "ready to remove"
+            print(f"  {qualifier} {len(image_plan.candidates)} image tag(s), "
+                  f"estimated {_format_size(image_plan.estimated_reclaimable)} reclaimable")
+            for image in image_plan.candidates:
+                ownership = ("recorded" if image.reference in image_plan.owned_references
+                             else "legacy Pier")
+                print(f"    {image.reference}  {_format_size(image.unique_size)}  [{ownership}]")
+        if image_plan.protected:
+            print(f"  protected {image_plan.protected} image tag(s) used by a "
+                  "container, active/pending task, checkpoint, or kept job")
+
+    has_images = bool(
+        image_plan and image_plan.docker_available and image_plan.candidates
+    )
+    if (not candidates and not has_images) or args.dry_run:
+        return 1 if docker_requested and image_plan and not image_plan.docker_available else 0
     if not args.yes:
-        answer = input("remove these settled local task files? [Y/n] ").strip().lower()
+        subject = "settled local files and Docker task images" if has_images else "settled local task files"
+        answer = input(f"remove these {subject}? [Y/n] ").strip().lower()
         if answer not in ("", "y", "yes"):
             print("nothing was deleted")
             return 0
     for item in candidates:
         checkpoints.remove(HOME, item)
-    print(f"cleaned {len(candidates)} task(s); freed {_format_size(total)}")
-    return 0
+    if candidates:
+        print(f"cleaned {len(candidates)} task(s); freed {_format_size(total)}")
+    image_failed = bool(image_plan and not image_plan.docker_available)
+    if has_images:
+        removed, reclaimed = image_cache.remove_images(HOME, image_plan.candidates)
+        print(f"removed {removed}/{len(image_plan.candidates)} Docker image tag(s); "
+              f"estimated {_format_size(reclaimed)} reclaimable")
+        if removed != len(image_plan.candidates):
+            image_failed = True
+            print("some images changed or became active during cleanup and were safely skipped")
+    return 1 if image_failed else 0
+
+
+def _maintain_image_cache(client: ApiClient, cfg: dict, *, phase: str) -> bool:
+    """Run bounded, ledger-only GC while no local worker is active.
+
+    A server read failure makes cleanup a no-op: without the active lease set
+    we cannot prove an image is disposable.  The return value controls only
+    NEW claims; existing leases/checkpoints are still allowed to run.
+    """
+    try:
+        active_ids = set(_active_by_id(client))
+    except Exception as exc:
+        print(f"image-cache maintenance skipped ({exc}); no Docker image was deleted")
+        allow_new_claims = _disk_allows_refill(cfg)
+        if not allow_new_claims:
+            print("disk space is below the 25 GiB safety floor; existing work may "
+                  "continue, but no new task will be claimed")
+        return allow_new_claims
+    result = image_cache.automatic_maintenance(
+        HOME, cfg, protected_assignment_ids=active_ids,
+    )
+    if result.removed:
+        print(f"image-cache {phase}: removed {result.removed} old DRadar image tag(s), "
+              f"estimated {_format_size(result.estimated_reclaimed)} reclaimable")
+    if result.note:
+        print(f"image-cache {phase}: {result.note}")
+    if phase.startswith("before") and result.legacy_count:
+        print(f"image-cache {phase}: found {result.legacy_count} legacy Pier image "
+              f"tag(s), estimated {_format_size(result.legacy_bytes)}. They are never "
+              "auto-deleted; inspect once with `dradar cleanup --docker "
+              "--all-task-images --dry-run`.")
+    if (phase == "before run" and image_cache.proxy_detected()
+            and "image_cache_mode" not in cfg):
+        print("proxy environment detected: balanced image caching stays enabled to "
+              "reduce repeat downloads. If proxy traffic is billed, run "
+              "`dradar config set image-cache-mode metered`.")
+    return result.allow_new_claims
+
+
+def _disk_allows_refill(cfg: dict) -> bool:
+    policy = image_cache.effective_policy(HOME, cfg)
+    try:
+        return shutil.disk_usage(HOME).free >= policy.min_free_bytes
+    except OSError:
+        return True
 
 
 def cmd_go(args) -> int:
@@ -1211,6 +1315,9 @@ def cmd_go(args) -> int:
         else:
             acquire_run_lock(HOME)
             sweep_orphan_compose(args.yes)
+            args.allow_new_claims = _maintain_image_cache(
+                client, cfg, phase="before run",
+            )
 
         # Preparing is a real phase: cloning the task repo and installing pier
         # can take minutes on a fresh machine. The heartbeat lets operators
@@ -1255,6 +1362,8 @@ def cmd_go(args) -> int:
                 return 1
 
         rc = _go_menu(args, cfg, client, tasks_root, telemetry=telemetry)
+        if not getattr(args, "parallel", False):
+            _maintain_image_cache(client, cfg, phase="after run")
         close_reason = "completed" if rc == 0 else "paused"
         return rc
     except (KeyboardInterrupt, EOFError):
@@ -1363,6 +1472,9 @@ def _run_worker_pool(args) -> int:
     tasks_root = tasks_root_from_config(cfg)
     acquire_run_lock(HOME)
     sweep_orphan_compose(True)
+    args.allow_new_claims = _maintain_image_cache(
+        client, cfg, phase="before worker pool",
+    )
     try:
         ensure_tasks_root(tasks_root)
         ensure_pier()
@@ -1393,6 +1505,7 @@ def _run_worker_pool(args) -> int:
     except (KeyboardInterrupt, EOFError):
         print("\nstopping workers safely; active tasks remain resumable...")
         _signal_workers(processes)
+        _maintain_image_cache(client, cfg, phase="after interrupted worker pool")
         raise
     except OSError as exc:
         # A later spawn can fail after earlier children are already live
@@ -1401,8 +1514,10 @@ def _run_worker_pool(args) -> int:
         # model quota even though the command appears to have failed.
         print(f"couldn't start every worker ({exc}); stopping those already started")
         _signal_workers(processes)
+        _maintain_image_cache(client, cfg, phase="after failed worker pool")
         return 1
     failed = [(i, rc) for i, rc in enumerate(returncodes, 1) if rc != 0]
+    _maintain_image_cache(client, cfg, phase="after worker pool")
     if failed:
         detail = ", ".join(f"worker {i}=exit {rc}" for i, rc in failed)
         print(f"worker pool finished with errors: {detail}")
@@ -1435,7 +1550,9 @@ def _align_refill_target_with_workers(args) -> None:
               "quota/task caps remain unchanged")
 
 
-def _acquire_batch(client: ApiClient, yes: bool) -> tuple[list[dict], bool]:
+def _acquire_batch(
+    client: ApiClient, yes: bool, *, allow_new_claims: bool = True,
+) -> tuple[list[dict], bool]:
     """The volunteer's held batch, plus whether this is a free-pick instance.
     Free-pick: the batch is whatever they claimed on the web. Menu mode
     (non-free-pick, e.g. claude) with nothing held: claim one from the menu
@@ -1452,7 +1569,7 @@ def _acquire_batch(client: ApiClient, yes: bool) -> tuple[list[dict], bool]:
     free_pick = data.get("free_pick", False)
     menu = data.get("menu")
 
-    if not active and not free_pick and menu:
+    if not active and not free_pick and menu and allow_new_claims:
         try:
             one = _claim_from_menu(client, menu, yes)
         except ApiError as exc:
@@ -1603,14 +1720,22 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                       "will be claimed, and existing leases/checkpoints stay untouched")
                 results.append(outcome)
                 break
-            try:
-                replenished = refill_plan.refill_once(HOME, client)
-            except ApiError as exc:
-                # One attempt per completed task is naturally bounded by task
-                # duration. Do not busy-loop; existing held work remains safe.
-                print(f"auto-refill unavailable for now ({exc}); continuing the held queue "
-                      "without retrying in a tight loop")
+            replenished = None
+            if not _disk_allows_refill(_load_config()):
+                refill_plan.stop(HOME, "disk free below image-cache safety floor")
+                print("continuous refill stopped before claiming another task: disk free "
+                      "is below the 25 GiB safety floor. Existing work stays held; run "
+                      "`dradar cleanup --docker --dry-run` first.")
             else:
+                try:
+                    replenished = refill_plan.refill_once(HOME, client)
+                except ApiError as exc:
+                    # One attempt per completed task is naturally bounded by task
+                    # duration. Do not busy-loop; existing held work remains safe.
+                    print(f"auto-refill unavailable for now ({exc}); continuing the held queue "
+                          "without retrying in a tight loop")
+                    replenished = None
+            if replenished is not None:
                 claimed = replenished.get("claimed", 0)
                 held = replenished.get("held", data.get("held", "?"))
                 target = (refill_plan.load(HOME) or {}).get("refill_to", "?")
@@ -1755,12 +1880,21 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
 
 def _prepare_batch(args, client: ApiClient) -> tuple[list[dict], bool]:
     """Claim/configure once, shared by the serial and supervised run paths."""
-    active, free_pick = _acquire_batch(client, args.yes)
+    allow_new_claims = getattr(args, "allow_new_claims", True)
+    active, free_pick = _acquire_batch(
+        client, args.yes, allow_new_claims=allow_new_claims,
+    )
     wants_pick = getattr(args, "pick", None)
     auto_target = getattr(args, "auto", None)
     wants_refill = getattr(args, "refill", False)
     wants = wants_pick or auto_target is not None
-    if active and free_pick and wants_pick:
+    if not allow_new_claims and wants:
+        print("disk safety floor reached — not claiming new tasks; already held work "
+              "can still run. Use `dradar cleanup --docker --dry-run` to inspect cleanup.")
+    elif not allow_new_claims and not active:
+        print("disk safety floor reached — not claiming a new task. Existing leases are "
+              "unchanged; use `dradar cleanup --docker --dry-run` to inspect cleanup.")
+    elif active and free_pick and wants_pick:
         print(f"already holding {len(active)} cell(s) — ignoring --pick; "
               "finish those (or `dradar resume`) before claiming exact cells")
     elif free_pick and auto_target is not None and not wants_refill:
@@ -1784,7 +1918,11 @@ def _prepare_batch(args, client: ApiClient) -> tuple[list[dict], bool]:
             active = _claim_picks(client, args.pick)
         except ApiError as exc:
             _exit_for(exc)
-    if getattr(args, "worker_child", False):
+    if not allow_new_claims and wants_refill:
+        refill_plan.stop(HOME, "disk free below image-cache safety floor")
+        args.refill = False
+        print("continuous refill not started because disk space is below the safety floor")
+    elif getattr(args, "worker_child", False):
         # The parent configured the shared plan before launching us. Rewriting
         # it from every child would reset its counters and race its file lock.
         if wants_refill and not refill_plan.is_running(HOME):
