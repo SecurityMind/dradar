@@ -22,14 +22,16 @@ def _make_checkpoint(
     job = home / "work" / "jobs" / f"a{assignment_id}-{suffix}"
     checkpoint = job / "task__trial" / "agent" / "checkpoint"
     checkpoint.mkdir(parents=True)
-    (checkpoint / "checkpoint.json").write_text(json.dumps({
+    heartbeat = updated_at or datetime.now(timezone.utc).isoformat()
+    manifest = checkpoint / "checkpoint.json"
+    manifest.write_text(json.dumps({
         "schema_version": 1,
         "checkpoint_id": checkpoint_id,
         "assignment_id": assignment_id,
         "phase": phase,
         "created_at": "2026-07-16T00:00:00Z",
-        "updated_at": updated_at or "2026-07-16T01:00:00Z",
-        "last_heartbeat": updated_at or "2026-07-16T01:00:00Z",
+        "updated_at": heartbeat,
+        "last_heartbeat": heartbeat,
         "model": "gpt-test",
         "task_id": "task-1",
         "effort": "high",
@@ -37,7 +39,8 @@ def _make_checkpoint(
         "resume_generation": generation,
         "root_thread_id": "thread-1",
     }))
-    return checkpoints.scan(home)[0]
+    return next(item for item in checkpoints.scan(home)
+                if item.manifest_path == manifest)
 
 
 def _assignment(assignment_id: str, generation: int = 0) -> dict:
