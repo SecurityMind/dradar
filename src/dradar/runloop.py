@@ -1299,7 +1299,13 @@ def cmd_go(args) -> int:
     # same hidden checkout as a fresh login, while any explicit legacy path
     # remains authoritative.
     tasks_root = tasks_root_from_config(cfg)
-    telemetry = RunnerTelemetry(client)
+    try:
+        target_workers = int(os.environ.get("DRADAR_POOL_SIZE", "1"))
+    except ValueError:
+        target_workers = 1
+    if not 1 <= target_workers <= 32:
+        target_workers = 1
+    telemetry = RunnerTelemetry(client, target_workers=target_workers)
     telemetry.start()
     close_reason = "error"
 
@@ -1498,6 +1504,7 @@ def _run_worker_pool(args) -> int:
         for index in range(1, count + 1):
             env = os.environ.copy()
             env["DRADAR_WORKER_INDEX"] = str(index)
+            env["DRADAR_POOL_SIZE"] = str(count)
             process = subprocess.Popen(command, env=env, **popen_kwargs)
             processes.append(process)
             print(f"  worker {index}/{count}: pid {process.pid}")

@@ -27,7 +27,7 @@ class FakeClient:
 
 def test_payload_is_one_session_not_one_per_assignment_and_stays_small():
     client = FakeClient()
-    telemetry = RunnerTelemetry(client, jitter=False)
+    telemetry = RunnerTelemetry(client, jitter=False, target_workers=20)
     telemetry.bind_batch("batch-1")
     telemetry.set_phase("running", "assignment-1")
     assert telemetry._send_once() == 60
@@ -42,8 +42,20 @@ def test_payload_is_one_session_not_one_per_assignment_and_stays_small():
     assert set(client.heartbeats[-1]) == {
         "protocol_version", "client_version", "session_id", "batch_id", "seq",
         "phase", "active_assignment_id", "client_monotonic_ms", "progress_counter",
-        "platform",
+        "platform", "target_workers",
     }
+    assert client.heartbeats[-1]["target_workers"] == 20
+
+
+def test_target_worker_count_is_bounded():
+    client = FakeClient()
+    for value in (0, 33):
+        try:
+            RunnerTelemetry(client, target_workers=value)
+        except ValueError as exc:
+            assert "between 1 and 32" in str(exc)
+        else:
+            raise AssertionError("out-of-range target worker count was accepted")
 
 
 def test_server_can_slow_cadence_but_not_make_it_pathological():

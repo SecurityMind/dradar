@@ -38,8 +38,17 @@ class RunnerTelemetry:
     their runner; recovery produces one matching notice.
     """
 
-    def __init__(self, client: ApiClient, *, jitter: bool = True):
+    def __init__(
+        self,
+        client: ApiClient,
+        *,
+        jitter: bool = True,
+        target_workers: int = 1,
+    ):
+        if not 1 <= target_workers <= 32:
+            raise ValueError("target_workers must be between 1 and 32")
         self.client = client
+        self.target_workers = target_workers
         self.session_id = uuid.uuid4().hex
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
@@ -101,6 +110,7 @@ class RunnerTelemetry:
                 "client_monotonic_ms": int(time.monotonic() * 1000),
                 "progress_counter": self._progress_counter,
                 "platform": platform_family(),
+                "target_workers": self.target_workers,
             }
 
     def _send_once(self) -> int:
