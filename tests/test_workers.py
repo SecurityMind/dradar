@@ -93,7 +93,7 @@ def test_worker_command_never_forwards_auto_selection():
 class _Telemetry:
     session_id = "session-test"
 
-    def __init__(self, _client):
+    def __init__(self, _client, **_kwargs):
         self.closed = None
 
     def start(self):
@@ -266,6 +266,7 @@ def test_pool_prepares_once_then_starts_requested_resume_workers(monkeypatch):
     assert runloop._run_worker_pool(_args()) == 0
     assert len(calls) == 3
     assert [p.env["DRADAR_WORKER_INDEX"] for p in calls] == ["1", "2", "3"]
+    assert [p.env["DRADAR_POOL_SIZE"] for p in calls] == ["3", "3", "3"]
     assert all("resume" in p.command and "--auto" not in p.command for p in calls)
 
 
