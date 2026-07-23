@@ -110,7 +110,9 @@ def _parse_size(value: object) -> int:
     return int(number * scale)
 
 
-def _run_docker(command: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess:
+def _run_docker(
+    command: list[str], *, timeout: int = 60, allow_fail: bool = False,
+) -> subprocess.CompletedProcess:
     docker = shutil.which("docker")
     if not docker:
         raise DockerUnavailable("Docker CLI not found")
@@ -120,10 +122,47 @@ def _run_docker(command: list[str], *, timeout: int = 60) -> subprocess.Complete
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise DockerUnavailable(f"couldn't query Docker: {exc}") from exc
-    if proc.returncode != 0:
+    if proc.returncode != 0 and not allow_fail:
         detail = (proc.stderr or proc.stdout or "Docker command failed").strip()
         raise DockerUnavailable(detail[:500])
     return proc
+
+
+def _missing_ok_command(command: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess:
+    """Run a command tolerating only ``No such image`` failures.
+
+    ``docker image inspect a b c`` exits non-zero as soon as any reference is
+    gone, yet still prints valid JSON for the survivors. Real Docker faults
+    (permission denied, daemon down, bad socket) look the same at the exit
+    code level, so we must distinguish them by message: a missing reference
+    is expected under concurrent cleanup and is swallowed, while every other
+    failure still propagates as :class:`DockerUnavailable` so the caller can
+    abort safely instead of mistaking a sick daemon for an empty cache.
+    """
+    proc = _run_docker(command, timeout=timeout, allow_fail=True)
+    if proc.returncode == 0:
+        return proc
+    detail = (proc.stderr or proc.stdout or "").strip()
+    if "no such image" in detail.lower():
+        return proc
+    raise DockerUnavailable(detail[:500])
+
+
+def _parse_inspect_payload(stdout: str) -> list[dict]:
+    """Parse ``docker image inspect`` JSON output into a list of dicts.
+
+    Docker prints one JSON object per inspected image as a JSON array. A
+    missing reference makes the whole command exit non-zero, but the images
+    that *do* exist are still serialized to stdout, so we parse what we can
+    instead of treating a single stale tag as a total failure.
+    """
+    try:
+        values = json.loads(stdout)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(values, list):
+        return []
+    return [value for value in values if isinstance(value, dict)]
 
 
 def _df_images() -> list[dict]:
@@ -145,13 +184,27 @@ def _inspect(references: list[str]) -> dict[str, dict]:
         chunk = references[start:start + 80]
         if not chunk:
             continue
-        proc = _run_docker(["image", "inspect", *chunk], timeout=120)
-        try:
-            values = json.loads(proc.stdout)
-        except json.JSONDecodeError as exc:
-            raise DockerUnavailable("Docker returned malformed image metadata") from exc
-        if not isinstance(values, list):
-            continue
+        # ``docker image inspect a b c`` exits non-zero if even one reference
+        # is missing, yet still emits valid JSON for the survivors. Query with
+        # ``missing_ok`` so a stale tag is tolerated while a real Docker fault
+        # (permission denied, daemon down) still propagates instead of being
+        # mistaken for an empty cache. Only when the chunk yields nothing
+        # usable do we fall back to inspecting references one by one, so a
+        # single concurrently-deleted tag can never abort the whole batch.
+        proc = _missing_ok_command(["image", "inspect", *chunk], timeout=120)
+        values = _parse_inspect_payload(proc.stdout)
+        # When the batch yielded nothing parseable, retry each reference on its
+        # own so a single truly-missing tag still recovers the survivors.
+        # ``_missing_ok_command`` only raises on a real Docker fault (permission
+        # denied, daemon down); such a fault must propagate here rather than be
+        # swallowed, otherwise a sick daemon would look like an empty cache and
+        # the caller could prune the whole ledger by mistake.
+        if not values and len(chunk) > 1:
+            for reference in chunk:
+                single = _missing_ok_command(
+                    ["image", "inspect", reference], timeout=60,
+                )
+                values.extend(_parse_inspect_payload(single.stdout))
         for value in values:
             if not isinstance(value, dict):
                 continue

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 from dradar import image_cache, local_config, runloop
+import pytest
 
 
 PROJECT = "some-task__abc1234"
@@ -355,3 +356,172 @@ def test_cleanup_requires_explicit_docker_flag_for_legacy_sweep(tmp_path: Path, 
         all_task_images=True, yes=True,
     )
     assert runloop.cmd_cleanup(args) == 1
+
+
+def test_inspect_tolerates_a_missing_tag_inside_a_batch(monkeypatch):
+    """A single stale tag must not abort the whole batch inspect.
+
+    ``docker image inspect a b c`` exits non-zero when one reference is gone,
+    but still prints valid JSON for the survivors on stdout. The batch loop
+    must parse those survivors and never propagate the failure.
+    """
+    monkeypatch.setattr(image_cache.shutil, "which", lambda _name: "/usr/bin/docker")
+    present = MAIN_REF
+    missing = "some-task__gone-main:latest"
+    calls = {"n": 0}
+
+    def fake_run(cmd, **kwargs):
+        calls["n"] += 1
+        refs = cmd[cmd.index("inspect") + 1:]
+        # Batch call: docker exits 1 because ``missing`` is gone, but stdout
+        # still carries the JSON for every reference that does exist.
+        if len(refs) > 1:
+            payload = [_inspect(present)]
+            return subprocess.CompletedProcess(cmd, 1, json.dumps(payload), "No such image")
+        # Per-reference fallback: the present image resolves, the missing one
+        # fails outright and is skipped.
+        if refs == [present]:
+            return subprocess.CompletedProcess(cmd, 0, json.dumps([_inspect(present)]), "")
+        return subprocess.CompletedProcess(cmd, 1, "", "No such image")
+
+    monkeypatch.setattr(image_cache.subprocess, "run", fake_run)
+
+    found = image_cache._inspect([present, missing])
+
+    # The present tag survives; the missing one is simply absent, and the
+    # batch loop never raised and never aborted on the stale reference.
+    assert set(found) == {present}
+    # Survivors were parsed straight from the batch stdout, so the missing
+    # tag did not force a one-by-one fallback in this path.
+    assert calls["n"] == 1
+
+
+def test_inspect_falls_back_to_per_reference_when_batch_stdout_empty(monkeypatch):
+    """When the batch yields no parseable output, inspect each ref alone.
+
+    Some Docker daemon responses surface the per-image metadata only when
+    references are queried individually. The fallback must recover every
+    surviving image and skip the truly-missing ones without raising.
+    """
+    monkeypatch.setattr(image_cache.shutil, "which", lambda _name: "/usr/bin/docker")
+    present_a = "some-task__aaa-main:latest"
+    present_b = "some-task__bbb-main:latest"
+    missing = "some-task__gone-main:latest"
+    calls = {"refs": []}
+
+    def fake_run(cmd, **kwargs):
+        refs = cmd[cmd.index("inspect") + 1:]
+        calls["refs"].append(refs)
+        if len(refs) > 1:
+            # Batch returns nothing usable (empty stdout, non-zero exit).
+            return subprocess.CompletedProcess(cmd, 1, "", "No such image")
+        if refs == [present_a]:
+            return subprocess.CompletedProcess(cmd, 0, json.dumps([_inspect(present_a)]), "")
+        if refs == [present_b]:
+            return subprocess.CompletedProcess(cmd, 0, json.dumps([_inspect(present_b)]), "")
+        return subprocess.CompletedProcess(cmd, 1, "", "No such image")
+
+    monkeypatch.setattr(image_cache.subprocess, "run", fake_run)
+
+    found = image_cache._inspect([present_a, missing, present_b])
+
+    assert set(found) == {present_a, present_b}
+    # The batch was attempted once, then every reference was retried alone.
+    assert calls["refs"][0] == [present_a, missing, present_b]
+    assert calls["refs"][1:] == [[present_a], [missing], [present_b]]
+
+
+def test_inspect_raises_on_non_missing_single_reference_error(monkeypatch):
+    """A single-reference inspect must propagate real Docker faults.
+
+    ``permission denied`` is not a missing image; swallowing it would let a
+    sick daemon masquerade as an empty cache. ``_inspect`` must raise
+    ``DockerUnavailable`` instead of returning ``{}``.
+    """
+    monkeypatch.setattr(image_cache.shutil, "which", lambda _name: "/usr/bin/docker")
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 1, "", "permission denied while accessing docker socket",
+        )
+
+    monkeypatch.setattr(image_cache.subprocess, "run", fake_run)
+
+    with pytest.raises(image_cache.DockerUnavailable):
+        image_cache._inspect([MAIN_REF])
+
+
+def test_inspect_raises_on_non_missing_error_during_batch_fallback(monkeypatch):
+    """A real Docker fault mid-fallback must not be silently dropped.
+
+    When the batch stdout is empty and we retry references one by one, a
+    non-``No such image`` failure on an individual reference is still a real
+    fault. It must propagate rather than be skipped as ``continue`` would do
+    for a merely-missing tag.
+    """
+    monkeypatch.setattr(image_cache.shutil, "which", lambda _name: "/usr/bin/docker")
+    present = MAIN_REF
+    other = "some-task__xyz-main:latest"
+    seen = {"n": 0}
+
+    def fake_run(cmd, **kwargs):
+        refs = cmd[cmd.index("inspect") + 1:]
+        seen["n"] += 1
+        if len(refs) > 1:
+            # Batch yields nothing usable (empty stdout, non-zero exit).
+            return subprocess.CompletedProcess(cmd, 1, "", "No such image")
+        # Per-reference: a real daemon fault, not a missing image.
+        return subprocess.CompletedProcess(
+            cmd, 1, "", "Got permission denied while trying to connect",
+        )
+
+    monkeypatch.setattr(image_cache.subprocess, "run", fake_run)
+
+    with pytest.raises(image_cache.DockerUnavailable):
+        image_cache._inspect([present, other])
+    # The batch was attempted, then the first single reference raised.
+    assert seen["n"] == 2
+
+
+def test_plan_cleanup_keeps_ledger_when_inspect_fails(monkeypatch, tmp_path: Path):
+    """A Docker fault during cleanup planning must not wipe the ledger.
+
+    If ``discover_pier_images`` cannot reach Docker (permission denied, daemon
+    down), every record would otherwise look stale and be pruned, silently
+    losing the cache ledger on every transient Docker hiccup. The fault must
+    propagate so the records survive untouched.
+    """
+    records = {
+        MAIN_REF: {"image_id": "sha256:abc", "assignment_id": "a1", "last_used_at": "1"},
+        "some-task__def5678-main:latest": {
+            "image_id": "sha256:def", "assignment_id": "a2", "last_used_at": "2",
+        },
+    }
+    with image_cache._ledger_lock(tmp_path):
+        image_cache._save_unlocked(tmp_path, records)
+    monkeypatch.setattr(image_cache.shutil, "which", lambda _name: "/usr/bin/docker")
+
+    def fake_run(cmd, **kwargs):
+        args = [a for a in cmd[1:] if a != "--format"]
+        # Inventory (``system df``) still works so we reach the inspect stage.
+        # Repository carries the ``-main`` suffix so the reference matches the
+        # Pier tag pattern and ``_inspect`` is actually exercised.
+        if args and args[0] == "system":
+            line = json.dumps({"Images": [{
+                "Repository": f"{PROJECT}-main", "Tag": "latest",
+                "ID": "sha256:abc", "UniqueSize": "2GB", "Containers": "0",
+            }]})
+            return subprocess.CompletedProcess(cmd, 0, line, "")
+        # Inspect stage fails with a non-missing Docker fault.
+        return subprocess.CompletedProcess(cmd, 1, "", "permission denied")
+
+    monkeypatch.setattr(image_cache.subprocess, "run", fake_run)
+
+    plan = image_cache.plan_cleanup(
+        tmp_path, protected_assignment_ids=set(), include_legacy=False,
+    )
+
+    # The fault surfaces as an unavailable plan, never an empty silent wipe.
+    assert plan.docker_available is False
+    # The ledger is intact: no record was pruned.
+    assert set(image_cache.load(tmp_path)) == set(records)
