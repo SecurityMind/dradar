@@ -52,6 +52,23 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative number") from exc
+    if parsed < 0 or parsed != parsed or parsed in (float("inf"), float("-inf")):
+        raise argparse.ArgumentTypeError("must be a non-negative finite number")
+    return parsed
+
+
+def _pass_rate(value: str) -> float:
+    parsed = _nonnegative_float(value)
+    if parsed > 1:
+        raise argparse.ArgumentTypeError("must be between 0 and 1 (0.5 = 50%)")
+    return parsed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dradar", description="DRadar crowdtest client")
     parser.add_argument("--version", action="version", version=__version__)
@@ -95,6 +112,30 @@ def main(argv: list[str] | None = None) -> int:
     p_cells.add_argument("--min-multiplier", type=float, metavar="X")
     p_cells.add_argument("--min-tests", type=_nonnegative_int, metavar="N")
     p_cells.add_argument("--max-tests", type=_nonnegative_int, metavar="N")
+    p_cells.add_argument(
+        "--min-minutes", type=_nonnegative_float, metavar="N",
+        help="minimum estimated runtime in minutes",
+    )
+    p_cells.add_argument(
+        "--max-minutes", type=_nonnegative_float, metavar="N",
+        help="maximum estimated runtime in minutes",
+    )
+    p_cells.add_argument(
+        "--min-cost", type=_nonnegative_float, metavar="USD",
+        help="minimum estimated model cost in USD",
+    )
+    p_cells.add_argument(
+        "--max-cost", type=_nonnegative_float, metavar="USD",
+        help="maximum estimated model cost in USD",
+    )
+    p_cells.add_argument(
+        "--min-pass-rate", type=_pass_rate, metavar="RATE",
+        help="minimum historical pass rate, from 0 to 1 (0.5 = 50%%)",
+    )
+    p_cells.add_argument(
+        "--max-pass-rate", type=_pass_rate, metavar="RATE",
+        help="maximum historical pass rate, from 0 to 1 (0.5 = 50%%)",
+    )
     p_cells.add_argument("--min-priority", type=int, metavar="N")
     p_cells.add_argument(
         "--sort", default="multiplier",
