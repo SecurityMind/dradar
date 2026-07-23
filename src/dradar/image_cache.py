@@ -142,13 +142,17 @@ def _missing_ok_command(command: list[str], *, timeout: int = 60) -> subprocess.
     proc = _run_docker(command, timeout=timeout, allow_fail=True)
     if proc.returncode == 0:
         return proc
-    detail = (proc.stderr or proc.stdout or "").strip()
-    if "no such image" in detail.lower():
+    detail = (proc.stderr or proc.stdout or "Docker command failed").strip()
+    lines = [line.strip().lower() for line in detail.splitlines() if line.strip()]
+    # Fail closed when Docker reports a mixture of a stale tag and a real
+    # daemon/socket/permission fault. A substring check would incorrectly
+    # accept the whole command as soon as any one line said "No such image".
+    if lines and all("no such image" in line for line in lines):
         return proc
     raise DockerUnavailable(detail[:500])
 
 
-def _parse_inspect_payload(stdout: str) -> list[dict]:
+def _parse_inspect_payload(stdout: str, *, allow_empty: bool = False) -> list[dict]:
     """Parse ``docker image inspect`` JSON output into a list of dicts.
 
     Docker prints one JSON object per inspected image as a JSON array. A
@@ -156,13 +160,20 @@ def _parse_inspect_payload(stdout: str) -> list[dict]:
     that *do* exist are still serialized to stdout, so we parse what we can
     instead of treating a single stale tag as a total failure.
     """
+    if not stdout.strip():
+        if allow_empty:
+            return []
+        raise DockerUnavailable("Docker returned empty image metadata")
     try:
         values = json.loads(stdout)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(values, list):
-        return []
-    return [value for value in values if isinstance(value, dict)]
+    except json.JSONDecodeError as exc:
+        raise DockerUnavailable("Docker returned malformed image metadata") from exc
+    if (not isinstance(values, list)
+            or any(not isinstance(value, dict) for value in values)):
+        raise DockerUnavailable("Docker returned malformed image metadata")
+    if not values and not allow_empty:
+        raise DockerUnavailable("Docker returned empty image metadata")
+    return values
 
 
 def _df_images() -> list[dict]:
@@ -192,9 +203,11 @@ def _inspect(references: list[str]) -> dict[str, dict]:
         # usable do we fall back to inspecting references one by one, so a
         # single concurrently-deleted tag can never abort the whole batch.
         proc = _missing_ok_command(["image", "inspect", *chunk], timeout=120)
-        values = _parse_inspect_payload(proc.stdout)
-        # When the batch yielded nothing parseable, retry each reference on its
-        # own so a single truly-missing tag still recovers the survivors.
+        values = _parse_inspect_payload(
+            proc.stdout, allow_empty=proc.returncode != 0,
+        )
+        # When a missing-tag batch yielded no survivors, retry each reference
+        # on its own so the references that still exist can be recovered.
         # ``_missing_ok_command`` only raises on a real Docker fault (permission
         # denied, daemon down); such a fault must propagate here rather than be
         # swallowed, otherwise a sick daemon would look like an empty cache and
@@ -204,7 +217,9 @@ def _inspect(references: list[str]) -> dict[str, dict]:
                 single = _missing_ok_command(
                     ["image", "inspect", reference], timeout=60,
                 )
-                values.extend(_parse_inspect_payload(single.stdout))
+                values.extend(_parse_inspect_payload(
+                    single.stdout, allow_empty=single.returncode != 0,
+                ))
         for value in values:
             if not isinstance(value, dict):
                 continue

@@ -483,6 +483,42 @@ def test_inspect_raises_on_non_missing_error_during_batch_fallback(monkeypatch):
     assert seen["n"] == 2
 
 
+@pytest.mark.parametrize("payload", ("", "[]", "{}", "{not-json"))
+def test_inspect_rejects_empty_or_malformed_success_payload(monkeypatch, payload):
+    """A successful Docker command must still provide valid image metadata.
+
+    Treating malformed output as an empty inventory would make every ledger
+    entry look stale and silently disable future automatic cache maintenance.
+    """
+    monkeypatch.setattr(image_cache.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(
+        image_cache.subprocess,
+        "run",
+        lambda cmd, **_kwargs: subprocess.CompletedProcess(cmd, 0, payload, ""),
+    )
+
+    with pytest.raises(image_cache.DockerUnavailable):
+        image_cache._inspect([MAIN_REF])
+
+
+def test_missing_ok_rejects_mixed_missing_and_real_errors(monkeypatch):
+    """A missing tag must not hide a simultaneous real Docker failure."""
+    monkeypatch.setattr(image_cache.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(
+        image_cache.subprocess,
+        "run",
+        lambda cmd, **_kwargs: subprocess.CompletedProcess(
+            cmd,
+            1,
+            "",
+            "No such image: stale\npermission denied while accessing Docker",
+        ),
+    )
+
+    with pytest.raises(image_cache.DockerUnavailable):
+        image_cache._missing_ok_command(["image", "inspect", MAIN_REF])
+
+
 def test_plan_cleanup_keeps_ledger_when_inspect_fails(monkeypatch, tmp_path: Path):
     """A Docker fault during cleanup planning must not wipe the ledger.
 
