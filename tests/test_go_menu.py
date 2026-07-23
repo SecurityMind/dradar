@@ -143,6 +143,17 @@ def test_free_pick_with_no_held_cells_points_to_the_web(monkeypatch, capsys, tmp
     assert rc == 0
 
 
+def test_disk_safety_floor_runs_existing_work_but_does_not_claim_new_menu_cell():
+    client = FakeClient({"active": [], "free_pick": False, "menu": MENU})
+
+    active, free_pick = runloop._acquire_batch(
+        client, yes=True, allow_new_claims=False,
+    )
+
+    assert active == [] and not free_pick
+    assert client.claim_calls == []
+
+
 # --- --auto / --pick: CLI-side claiming for free-pick instances (volunteer -
 # issue #1, 2026-07-15) so an Agent never has to touch the web UI -----------
 

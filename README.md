@@ -93,7 +93,8 @@ dradar status                          # 查看自己的提交和判分
 | `dradar checkpoints` | 否 | 查看本地恢复点、阶段、更新时间和磁盘占用 |
 | `dradar checkpoint discard` | 是 | 删除指定恢复点，并安全重新开放对应格子 |
 | `dradar retry-upload` | 是 | 重试已经运行完成但因网络等原因没有上传的结果 |
-| `dradar cleanup` | 本地删除 | 安全清理已结算且不可恢复的本地任务文件 |
+| `dradar cleanup` | 本地删除 | 安全清理已结算的本地任务文件及 DRadar/Pier 镜像缓存 |
+| `dradar config show/set` | 本地配置 | 查看或调整镜像缓存模式与容量上限，不显示账号凭据 |
 | `dradar refill status` | 否 | 查看本机持续补题计划和额度预留 |
 | `dradar refill stop` | 是 | 停止继续领取新题，保留已有任务和 checkpoint |
 | `dradar rename` | 是 | 修改榜单昵称，积分不变 |
@@ -439,6 +440,9 @@ dradar cleanup --dry-run
 dradar cleanup
 dradar cleanup -y
 dradar cleanup --include-kept
+dradar cleanup --docker --dry-run
+dradar cleanup --docker
+dradar cleanup --docker --all-task-images  # 一次性处理升级前遗留镜像
 ```
 
 清理前必须成功从服务端取得当前租约列表；网络失败时什么都不删除。以下内容默认保护：
@@ -450,6 +454,33 @@ dradar cleanup --include-kept
 `--dry-run` 只列出候选文件和预计释放空间。`--include-kept` 才会删除由 `--keep` 保护的
 已结算目录。成功上传后，非 `--keep` 的交互运行会询问是否立即清理；无人值守运行按
 安全生命周期自动回收已确认结算的副本。
+
+Docker 镜像不会在每题结束后立刻删除。CLI 会记录本轮任务实际产生的镜像引用和 ID，
+并在没有 worker 运行的批次边界按“最久未使用”顺序维护缓存。默认 `balanced` 模式的
+动态上限为磁盘容量的 5%（最低 20 GiB、最高 50 GiB），超限后清理到上限的 75%；
+可用空间低于 25 GiB 时停止领取新题，但不打断已持有任务。运行中、待补传、存在
+checkpoint 或由 `--keep` 保护的镜像均不会删除。
+
+自动清理只处理 CLI 自己记录、且镜像 ID 与 Docker Compose 标签仍一致的条目；不运行
+全局 `docker image prune`，不使用强制删除，也不会碰其他 Docker 项目。升级前遗留的
+Pier 镜像必须显式使用 `--all-task-images`，仍会经过标签、容器和本地恢复状态校验。
+`--dry-run` 会先展示镜像列表和预计可回收空间。
+
+Docker 的 BuildKit 构建缓存是全局共享的，无法可靠判断其中哪些记录只属于 DRadar，
+因此 CLI 不会自动执行 `docker buildx prune`。删除题目镜像后保留共享构建层也能减少下次
+运行的代理下载量；预计释放空间可能因共享层和 BuildKit 缓存而与 Docker 最终值不同。
+若达到磁盘安全线后空间仍不足，CLI 会停止领新题并让用户在 Docker 中自行决定是否清理
+全局构建缓存，而不是替用户删除其他项目的缓存。
+
+使用计费代理或按量网络时，可以切换为节省流量模式；该模式不因缓存超限自动删除，
+磁盘到达安全线时停止领新题并提示人工处理：
+
+```bash
+dradar config set image-cache-mode metered
+dradar config set image-cache-limit-gb 50
+dradar config set image-cache-limit-gb auto  # 恢复动态上限
+dradar config show
+```
 
 ## 领取冲突与常见错误
 
