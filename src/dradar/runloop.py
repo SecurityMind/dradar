@@ -304,9 +304,144 @@ def _apply_codex_usage_to_result(result_path: Path, usage: dict) -> None:
     result_path.write_text(json.dumps(payload, ensure_ascii=False))
 
 
+def _safe_copy_session(src: Path, dest: Path) -> bool:
+    """Copy one Codex session file into the archive with safe permissions.
+
+    Guards against symlink escapes and path traversal: the source must live
+    under the trial's ``agent/sessions`` tree, and the destination is always
+    created/normalized before any bytes land. Returns False (not raising) on
+    any failure so archiving can never break an upload.
+    """
+    try:
+        # Reject symlinks entirely — we only want the real transcript files.
+        # Check BEFORE resolve(), since resolve() collapses the link to its
+        # target and the is_symlink() check would then miss it.
+        if src.is_symlink() or dest.is_symlink():
+            return False
+        src = src.resolve()
+        if not src.is_file():
+            return False
+        dest.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(dest.parent, 0o700)
+        shutil.copy2(src, dest)
+        os.chmod(dest, 0o600)
+        return True
+    except Exception:
+        return False
+
+
+def _safe_assignment_component(assignment_id: str) -> str:
+    """Return a filesystem-safe path component for an assignment id.
+
+    Only strict ASCII ``[A-Za-z0-9_-]`` are allowed (note: ``str.isalnum()``
+    accepts Unicode letters/digits, which we must NOT, so we test each byte
+    against an explicit ASCII whitelist). Anything else becomes ``_``. This
+    keeps the archive directory name from escaping the archive root or
+    colliding with filesystem separators, regardless of what the server sends
+    as an assignment id.
+    """
+    allowed = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+    safe = "".join(chr(b) if b in allowed else "_" for b in assignment_id.encode("utf-8", "ignore"))
+    return safe or "unknown"
+
+
+def _archive_codex_sessions(
+    trial_dir: Path, assignment_id: str, enabled: bool
+) -> None:
+    """Best-effort archive of the in-container Codex session transcripts so a
+    volunteer can inspect token usage locally after a run.
+
+    Pier copies the in-container ``$CODEX_HOME/sessions`` into
+    ``<trial_dir>/agent/sessions`` after each run. By default a *completed*
+    run's job dir is deleted, which throws those away. This copies them to a
+    DRadar-owned location before cleanup.
+
+    Archiving is strictly opt-in (``--archive-session``); when ``enabled`` is
+    False this is a no-op. The destination is always::
+
+        ~/.dradar/history/codex-sessions/<safe-assignment-id>/
+
+    i.e. kept entirely separate from Codex's own ``~/.codex/sessions`` so it
+    never pollutes Codex's native session index or resume discovery.
+
+    Files get 0600, the directory 0700. De-duplicates by assignment id and
+    records total bytes archived for later pruning.
+    """
+    if not enabled:
+        return
+    src_sessions = trial_dir / "agent" / "sessions"
+    if not src_sessions.is_dir():
+        return
+    # Only files directly under the date-sharded session dirs are transcripts.
+    sources = [p for p in src_sessions.rglob("*.jsonl") if p.is_file() and not p.is_symlink()]
+    if not sources:
+        return
+
+    dest_root = HOME / "history" / "codex-sessions" / _safe_assignment_component(assignment_id)
+    try:
+        dest_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(dest_root, 0o700)
+        archived = 0
+        for src in sources:
+            # Defensive: ensure the resolved source is under the trial tree.
+            try:
+                rel = src.resolve().relative_to(src_sessions.resolve())
+            except ValueError:
+                continue
+            # Preserve the date-sharded relative layout (e.g. 2026/07/18/name)
+            # so same-named transcripts from different dates don't silently
+            # overwrite each other; rel is already confined under src_sessions.
+            dest = dest_root / rel
+            if _safe_copy_session(src, dest):
+                archived += 1
+        # Record disk usage for the `dradar sessions prune` command.
+        try:
+            total = sum(
+                (p.stat().st_size for p in dest_root.rglob("*") if p.is_file()),
+                0,
+            )
+            meta = dest_root / ".archive-meta.json"
+            meta.write_text(
+                json.dumps(
+                    {"assignment_id": assignment_id, "bytes": total, "files": archived},
+                    indent=2,
+                )
+            )
+            os.chmod(meta, 0o600)
+        except Exception:
+            pass
+        print(f"  archived {archived} codex session file(s) to {dest_root}")
+    except Exception as exc:  # pragma: no cover - best effort
+        print(f"  (warning) could not archive codex sessions locally: {exc}")
+
+
 def _upload_trial(
     client: ApiClient, entry: dict, *, ask_cleanup: bool = False,
+    archive_session: bool = False,
 ) -> str:
+    """Scrub + upload one trial's artifacts, described by a pending-ledger
+    entry dict (assignment_id/nonce/task_id/trial_dir/meta/outcome/job_dir/
+    keep) — the same shape the ledger round-trips, so what persists on failure
+    is identical by construction to what was attempted. Shared by the normal
+    post-run path and by `dradar retry-upload` (which passes loaded ledger
+    entries straight through). Never exits — returns an outcome tag so
+    callers (the held-batch loop, a retry scan) can carry on with the next
+    item.
+
+    The entry is recorded in the local pending-upload ledger BEFORE the
+    submit attempt, so a process death mid-upload (Ctrl-C/kill/OOM during a
+    large multipart POST) can't orphan a completed, quota-burning trial.
+    Every exit settles it: success, 409 "already submitted", and 410 remove
+    the entry; fencing conflicts and transient errors keep it for retry. The
+    raw trial_dir is never touched by scrubbing
+    (which writes to a fresh tempdir), so a later retry re-scrubs from the
+    same untouched originals."""
+    # The archive choice is persisted on the ledger entry so that a later
+    # retry (cmd_retry_upload / auto-heal) replays the SAME choice the user
+    # made originally. A pre-existing key (loaded from the ledger) wins;
+    # otherwise seed it from the call-time default. Old ledgers lacking the
+    # field safely default to False (no archiving).
+    entry.setdefault("archive_session", bool(archive_session))
     """Scrub + upload one trial's artifacts, described by a pending-ledger
     entry dict (assignment_id/nonce/task_id/trial_dir/meta/outcome/job_dir/
     keep) — the same shape the ledger round-trips, so what persists on failure
@@ -533,6 +668,14 @@ def _upload_trial(
                 print(f"  local artifacts kept: {job_dir}  "
                       "(`dradar cleanup --include-kept` removes them later)")
         else:
+            # Best-effort: archive the in-container Codex session transcripts
+            # before the job dir is removed, so volunteers can inspect token
+            # usage locally. Never blocks or breaks the upload. The choice is
+            # read from the ledger entry so retries honor the original opt-in.
+            _archive_codex_sessions(
+                Path(entry["trial_dir"]), assignment_id,
+                bool(entry.get("archive_session", False)),
+            )
             shutil.rmtree(job_dir, ignore_errors=True)
     return "interrupted" if outcome == "interrupted" else "submitted"
 
@@ -757,12 +900,13 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "meta": meta, "outcome": outcome,
         "job_dir": str(art.job_dir) if art.job_dir else None, "keep": args.keep,
         "resume_generation": assignment.get("resume_generation", 0),
+        "archive_session": getattr(args, "archive_session", False),
     }, ask_cleanup=(
         outcome == "completed"
         and not args.keep
         and not getattr(args, "yes", False)
         and not getattr(args, "parallel", False)
-    ))
+    ), archive_session=getattr(args, "archive_session", False))
 
 
 def _retry_pending_uploads(client: ApiClient) -> None:
@@ -834,6 +978,7 @@ def _checkpoint_upload_entry(
         "keep": args.keep,
         "resume_generation": assignment.get(
             "resume_generation", item.resume_generation),
+        "archive_session": getattr(args, "archive_session", False),
     }
 
 
@@ -1396,6 +1541,8 @@ def _worker_command(args) -> list[str]:
     ]
     if args.keep:
         command.append("--keep")
+    if getattr(args, "archive_session", False):
+        command.append("--archive-session")
     if args.allow_task_drift:
         command.append("--allow-task-drift")
     if args.dev_agent:
@@ -2003,3 +2150,40 @@ __all__ = ["cmd_go", "_go_menu",
            "_choose_menu_entry", "_print_menu", "_print_assignment",
            "cmd_retry_upload", "_retry_pending_uploads", "_upload_trial",
            "_artifacts_from_trial_dir"]
+
+
+def cmd_sessions_prune(args) -> int:
+    """Delete archived Codex session transcripts under
+    ``~/.dradar/history/codex-sessions/``.
+
+    By default shows total disk usage and prompts; pass ``--yes`` to actually
+    delete. This is the explicit cleanup the archive feature relies on so it
+    cannot grow unbounded across many runs.
+    """
+    import json as _json
+
+    root = HOME / "history" / "codex-sessions"
+    if not root.is_dir():
+        print("no archived codex sessions to prune")
+        return 0
+    assignments = [d for d in root.iterdir() if d.is_dir() and not d.is_symlink()]
+    total_bytes = 0
+    for d in assignments:
+        for f in d.rglob("*"):
+            if f.is_file() and not f.is_symlink():
+                total_bytes += f.stat().st_size
+    count = len(assignments)
+    mb = total_bytes / (1024 * 1024)
+    if getattr(args, "yes", False):
+        import shutil as _shutil
+
+        for d in assignments:
+            _shutil.rmtree(d, ignore_errors=True)
+        # remove the now-empty root if nothing else lives there
+        if root.is_dir() and not any(root.iterdir()):
+            _shutil.rmtree(root, ignore_errors=True)
+        print(f"pruned {count} archived session dir(s), freed {mb:.1f} MB")
+    else:
+        print(f"{count} archived session dir(s), {mb:.1f} MB total")
+        print("pass --yes to delete them all")
+    return 0
