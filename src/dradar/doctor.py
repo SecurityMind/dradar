@@ -2,6 +2,7 @@
 per-platform fix hints, and a live server-login probe.
 """
 
+import ctypes
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,11 @@ def _check(label: str, ok: bool, hint: str = "") -> bool:
     mark = "ok " if ok else "FAIL"
     print(f"  [{mark}] {label}" + ("" if ok else f"  -> {hint}"))
     return ok
+
+
+def _skip(label: str, reason: str) -> None:
+    """Report a dependency that was deliberately not installed or downloaded."""
+    print(f"  [skip] {label}  -> {reason}")
 
 
 def _platform(proc_version: Path = Path("/proc/version")) -> str:
@@ -82,6 +88,48 @@ def _probe(cmd: list[str]) -> bool:
         return False
 
 
+_PF_VIRT_FIRMWARE_ENABLED = 21
+
+
+def _windows_virtualization_state() -> str:
+    """Best-effort native-Windows virtualization probe.
+
+    Windows' language-neutral ``IsProcessorFeaturePresent`` API reports whether
+    firmware virtualization is enabled *and available to the OS*. A false
+    result is deliberately called ``unavailable`` rather than ``disabled``:
+    BIOS/UEFI, Windows features, nested virtualization, or the host platform
+    may each be responsible. If the API itself is unavailable, fail closed to
+    ``unknown`` and retain the generic Docker guidance.
+    """
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        probe = kernel32.IsProcessorFeaturePresent
+        probe.argtypes = [ctypes.c_uint32]
+        probe.restype = ctypes.c_int
+        available = bool(probe(_PF_VIRT_FIRMWARE_ENABLED))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return "unknown"
+    return "available" if available else "unavailable"
+
+
+def _windows_daemon_hint(virtualization_state: str) -> str:
+    if virtualization_state == "unavailable":
+        return (
+            "Windows reports that firmware virtualization is not available to "
+            "the OS; check that Intel VT-x/Intel Virtualization Technology or "
+            "AMD-V/SVM Mode is enabled in BIOS/UEFI, enable the required Windows "
+            "backend (Virtual Machine Platform/WSL2, or Hyper-V when supported), "
+            "enable nested virtualization when inside a VM, reboot, then start "
+            "Docker Desktop in Linux-container mode"
+        )
+    return (
+        "start Docker Desktop and switch it to Linux containers; if Docker "
+        "Desktop says 'Virtualization support not detected', enable Intel "
+        "VT-x or AMD-V/SVM in BIOS/UEFI, enable Virtual Machine Platform/WSL2 "
+        "(or Hyper-V when supported), and reboot"
+    )
+
+
 def cmd_doctor(args) -> int:
     cfg = _load_config()
     plat = _platform()
@@ -95,23 +143,37 @@ def cmd_doctor(args) -> int:
 
     docker = shutil.which("docker")
     all_ok &= _check("docker CLI", bool(docker), hints["cli"])
+    daemon_ready = False
     if docker:
-        daemon = _probe([docker, "info"])
-        all_ok &= _check("docker daemon", daemon, hints["daemon"])
+        daemon_ready = _probe([docker, "info"])
+        daemon_hint = hints["daemon"]
+        if plat == "windows" and not daemon_ready:
+            daemon_hint = _windows_daemon_hint(_windows_virtualization_state())
+        all_ok &= _check("docker daemon", daemon_ready, daemon_hint)
         compose = _probe([docker, "compose", "version"])
         all_ok &= _check("docker compose plugin", compose, hints["compose"])
+
+    # Native Windows cannot run a task until Docker Desktop's Linux engine is
+    # healthy. Avoid installing Pier or cloning the benchmark repository while
+    # that prerequisite is blocked; this keeps doctor diagnostic/read-mostly
+    # and prevents a large, unusable download. Other platforms retain their
+    # established bootstrap behavior.
+    windows_bootstrap_blocked = plat == "windows" and not daemon_ready
 
     # pier is auto-installed on `dradar go`; do it here too so doctor reflects
     # the ready state instead of a scary FAIL a volunteer (or an agent following
     # a runbook) then chases with the wrong fix.
-    try:
-        runner.ensure_pier()
-    except runner.RunnerError:
-        pass
-    pier = shutil.which("pier")
-    pier_ready = bool(
-        pier and runner._pier_version_compatible(runner._pier_version(pier)))
-    all_ok &= _check("pier", pier_ready, runner.PIER_INSTALL_COMMAND)
+    if windows_bootstrap_blocked:
+        _skip("pier bootstrap", "fix the Docker daemon first; no installation attempted")
+    else:
+        try:
+            runner.ensure_pier()
+        except runner.RunnerError:
+            pass
+        pier = shutil.which("pier")
+        pier_ready = bool(
+            pier and runner._pier_version_compatible(runner._pier_version(pier)))
+        all_ok &= _check("pier", pier_ready, runner.PIER_INSTALL_COMMAND)
 
     # Agent: you only need ONE family working. If the one you're set up for is
     # ready, say so and stay quiet about the other -- don't print a FAIL for
@@ -139,16 +201,23 @@ def cmd_doctor(args) -> int:
     # checkout reports OK instead of a FAIL whose hint doesn't actually fix it.
     tasks_root = tasks_root_from_config(cfg)
     if not tasks_root.is_dir():
-        try:
-            runner.ensure_tasks_root(tasks_root)
-        except runner.RunnerError:
-            pass
-    all_ok &= _check(
-        "tasks_root",
-        tasks_root.is_dir(),
-        "run `dradar go` once — it auto-clones the task repo at "
-        f"{tasks_root}",
-    )
+        if windows_bootstrap_blocked:
+            _skip(
+                "tasks_root download",
+                "fix the Docker daemon first; no benchmark repository downloaded",
+            )
+        else:
+            try:
+                runner.ensure_tasks_root(tasks_root)
+            except runner.RunnerError:
+                pass
+    if tasks_root.is_dir() or not windows_bootstrap_blocked:
+        all_ok &= _check(
+            "tasks_root",
+            tasks_root.is_dir(),
+            "run `dradar go` once — it auto-clones the task repo at "
+            f"{tasks_root}",
+        )
 
     free_gb = shutil.disk_usage(Path.home()).free / 1e9
     all_ok &= _check(f"disk free ({free_gb:.0f} GB)", free_gb > 20, "need >20GB for task images")
@@ -166,4 +235,7 @@ def cmd_doctor(args) -> int:
     return 0 if all_ok else 1
 
 
-__all__ = ["cmd_doctor", "_platform", "_check", "_probe", "_DOCKER_HINTS", "_CODEX_HINTS"]
+__all__ = [
+    "cmd_doctor", "_platform", "_check", "_probe", "_DOCKER_HINTS",
+    "_CODEX_HINTS", "_windows_virtualization_state",
+]
