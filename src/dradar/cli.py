@@ -28,6 +28,7 @@ from .leases import cmd_leases, cmd_release
 from .runloop import (
     cmd_checkpoint_discard, cmd_checkpoints, cmd_cleanup, cmd_go,
     cmd_refill_status, cmd_refill_stop, cmd_retry_upload,
+    cmd_sessions_prune,
 )
 
 __all__ = ["main"]
@@ -239,6 +240,14 @@ def main(argv: list[str] | None = None) -> int:
     p_cp_discard.add_argument("checkpoint_id", metavar="ID")
     p_cp_discard.set_defaults(func=cmd_checkpoint_discard, lease_hint=True)
 
+    p_sessions = sub.add_parser(
+        "sessions", help="manage locally archived Codex session transcripts")
+    sessions_sub = p_sessions.add_subparsers(dest="sessions_command", required=True)
+    p_sess_prune = sessions_sub.add_parser(
+        "prune", help="show or delete archived codex sessions under ~/.dradar/history/codex-sessions")
+    p_sess_prune.add_argument("-y", "--yes", action="store_true", help="actually delete (default: dry-run, show sizes)")
+    p_sess_prune.set_defaults(func=cmd_sessions_prune)
+
     for name, help_, is_resume in (
         ("go", "fetch an assignment and run it", False),
         ("resume", "continue the active assignment (no-op if none)", True),
@@ -251,6 +260,12 @@ def main(argv: list[str] | None = None) -> int:
             help="run even if your deep-swe checkout differs from the server's pinned version",
         )
         p.add_argument("--dev-agent", help=argparse.SUPPRESS)  # oracle/nop for pipeline tests
+        p.add_argument(
+            "--archive-session", action="store_true",
+            help="opt-in: archive Codex session transcripts locally after each "
+                 "run to ~/.dradar/history/codex-sessions/<assignment-id>/ "
+                 "(separate from Codex's own ~/.codex/sessions; off by default).",
+        )
         p.add_argument(
             "--parallel", action="store_true",
             help="allow a second dradar on this machine (implies -y): sessions "
