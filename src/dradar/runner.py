@@ -36,6 +36,7 @@ from .providers import (
     DEEPSEEK_SUPPORTED_EFFORTS,
     assignment_codex_provider,
     create_deepseek_auth_json,
+    deepseek_base_url,
     deepseek_catalog_error,
     deepseek_catalog_path,
 )
@@ -67,22 +68,25 @@ ALLOWLIST_TOML = (
 # because DeepSeek's official setup script explicitly removes them when the
 # catalog is active. Codex reads the provider credential from an uploaded
 # auth.json because ``requires_openai_auth`` is true; no API-key value is
-# passed through argv or ``docker compose exec -e``.
-DEEPSEEK_TOML = (
-    'web_search = "disabled"\n'
-    'model_provider = "deepseek"\n'
-    'preferred_auth_method = "apikey"\n'
-    'forced_login_method = "api"\n'
-    f'model_catalog_json = "{DEEPSEEK_CATALOG_REMOTE_PATH}"\n'
-    '[features]\n'
-    'apps = false\n'
-    'remote_plugin = false\n'
-    '[model_providers.deepseek]\n'
-    'name = "deepseek"\n'
-    'base_url = "https://api.deepseek.com/"\n'
-    'wire_api = "responses"\n'
-    'requires_openai_auth = true\n'
-)
+# passed through argv or ``docker compose exec -e``. The base URL follows the
+# selected endpoint: DeepSeek official API by default, or the OpenCode Go
+# subscription gateway when `dradar config set deepseek-endpoint opencode-go`.
+def deepseek_toml() -> str:
+    return (
+        'web_search = "disabled"\n'
+        'model_provider = "deepseek"\n'
+        'preferred_auth_method = "apikey"\n'
+        'forced_login_method = "api"\n'
+        f'model_catalog_json = "{DEEPSEEK_CATALOG_REMOTE_PATH}"\n'
+        '[features]\n'
+        'apps = false\n'
+        'remote_plugin = false\n'
+        '[model_providers.deepseek]\n'
+        'name = "deepseek"\n'
+        f'base_url = "{deepseek_base_url()}"\n'
+        'wire_api = "responses"\n'
+        'requires_openai_auth = true\n'
+    )
 DEEPSEEK_AGENT_IMPORT_PATH = "_dradar_pier_deepseek:DeepSeekCodex"
 DEEPSEEK_AGENT_MODULE_FILENAME = "_dradar_pier_deepseek.py"
 
@@ -311,7 +315,7 @@ def _ensure_codex_submission_prompt(home: Path) -> Path:
 
 def _ensure_deepseek_config(home: Path) -> Path:
     path = home / "codex-deepseek-v4-flash.toml"
-    return _materialize_shared_file(path, DEEPSEEK_TOML.encode())
+    return _materialize_shared_file(path, deepseek_toml().encode())
 
 
 def _validated_deepseek_catalog() -> Path:

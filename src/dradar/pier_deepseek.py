@@ -11,6 +11,8 @@ trajectory collection to Pier.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import shlex
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -25,6 +27,31 @@ _CATALOG_SHA256 = (
     "b459a6e438d6a9939d01fd0dbb4693f165ed732bc8e4fd58d7145d9d94bd49a4"
 )
 
+# Mirrors dradar.providers.deepseek_base_url(). This file is copied verbatim
+# into the isolated task directory and imported there as a standalone module,
+# so it cannot import from dradar.* — the endpoint table is kept in sync with
+# providers.py by hand.
+_DEEPSEEK_ENDPOINT_DEFAULT = "official"
+_DEEPSEEK_ENDPOINTS = {
+    "official": "https://api.deepseek.com/",
+    "opencode-go": "https://opencode.ai/zen/go/v1",
+}
+
+
+def _deepseek_base_url() -> str:
+    """Resolve the selected DeepSeek endpoint from the local config."""
+
+    endpoint = None
+    home = Path(os.environ.get("DRADAR_HOME", Path.home() / ".dradar"))
+    try:
+        cfg = json.loads((home / "config.json").read_text())
+        endpoint = cfg.get("deepseek_endpoint")
+    except (OSError, json.JSONDecodeError):
+        pass
+    if not isinstance(endpoint, str) or endpoint not in _DEEPSEEK_ENDPOINTS:
+        endpoint = _DEEPSEEK_ENDPOINT_DEFAULT
+    return _DEEPSEEK_ENDPOINTS[endpoint]
+
 
 class DeepSeekCodex(Codex):
     """Stock Codex plus a fail-closed, container-local model catalog."""
@@ -37,10 +64,12 @@ class DeepSeekCodex(Codex):
         Stock Pier's Codex allowlist always includes api.openai.com as a
         default. DeepSeek does not need that endpoint, and apps, remote plugin,
         and web search are intentionally disabled for benchmark isolation.
+        The allowed egress tracks the selected endpoint (DeepSeek official
+        API or the OpenCode Go subscription gateway).
         """
 
         return allowlist_from_urls(
-            ["https://api.deepseek.com/"],
+            [_deepseek_base_url()],
             default_domains=[],
         )
 
