@@ -36,6 +36,36 @@ DEEPSEEK_CATALOG_SOURCE_VERSION = "1.0.0"
 DEEPSEEK_RUN_CONFIG_VERSION = "deepseek-codex-official-catalog-v1"
 DEEPSEEK_RUNTIME_PROFILE = "public-pier-0.3.0-catalog-v1"
 
+# Selectable DeepSeek provider endpoints. "official" is the DeepSeek API;
+# "opencode-go" routes the same model through the OpenCode Go subscription
+# gateway (OpenAI-compatible /responses route, model id matches the official
+# catalog slug). The active choice is stored in config.json under
+# `deepseek_endpoint` (see `dradar config set deepseek-endpoint`).
+DEEPSEEK_ENDPOINT_DEFAULT = "official"
+DEEPSEEK_ENDPOINTS = {
+    "official": "https://api.deepseek.com/",
+    "opencode-go": "https://opencode.ai/zen/go/v1",
+}
+
+
+def deepseek_base_url(endpoint: str | None = None) -> str:
+    """Resolve the DeepSeek provider base URL for a named endpoint.
+
+    With no argument, the endpoint is read from the local config
+    (``deepseek_endpoint``), defaulting to the official DeepSeek API.
+    """
+
+    if endpoint is None:
+        from . import local_config  # deferred: providers.py is dependency-free
+
+        cfg = local_config._load_config()
+        endpoint = cfg.get("deepseek_endpoint") or DEEPSEEK_ENDPOINT_DEFAULT
+    try:
+        return DEEPSEEK_ENDPOINTS[endpoint]
+    except KeyError as exc:
+        raise ValueError(f"unsupported DeepSeek endpoint: {endpoint}") from exc
+
+
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
 

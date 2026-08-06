@@ -704,6 +704,7 @@ def proxy_detected() -> bool:
 
 def cmd_config_show(args) -> int:
     from . import local_config
+    from . import providers
 
     cfg = local_config._load_config()
     policy = effective_policy(local_config.HOME, cfg)
@@ -715,11 +716,14 @@ def cmd_config_show(args) -> int:
     print(f"  cleanup target: {policy.target_bytes / GIB:.1f} GiB")
     print(f"  minimum free disk: {policy.min_free_bytes / GIB:.0f} GiB")
     print(f"  proxy environment detected: {'yes' if proxy_detected() else 'no'}")
+    endpoint = cfg.get("deepseek_endpoint") or providers.DEEPSEEK_ENDPOINT_DEFAULT
+    print(f"  deepseek endpoint: {endpoint} ({providers.DEEPSEEK_ENDPOINTS[endpoint]})")
     return 0
 
 
 def cmd_config_set(args) -> int:
     from . import local_config
+    from . import providers
 
     cfg = local_config._load_config()
     if args.key == "image-cache-mode":
@@ -727,6 +731,15 @@ def cmd_config_set(args) -> int:
         if value not in {"balanced", "metered", "disk"}:
             raise SystemExit("image-cache-mode must be balanced, metered, or disk")
         cfg["image_cache_mode"] = value
+        shown = value
+    elif args.key == "deepseek-endpoint":
+        value = args.value.strip().lower()
+        if value not in providers.DEEPSEEK_ENDPOINTS:
+            raise SystemExit(
+                "deepseek-endpoint must be one of: "
+                + ", ".join(sorted(providers.DEEPSEEK_ENDPOINTS))
+            )
+        cfg["deepseek_endpoint"] = value
         shown = value
     else:
         value = args.value.strip().lower()

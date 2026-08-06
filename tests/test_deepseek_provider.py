@@ -49,6 +49,12 @@ def _assignment(**overrides) -> dict:
 def _command(tmp_path: Path, monkeypatch, assignment=None) -> tuple[list[str], Path]:
     assignment = assignment or _assignment()
     monkeypatch.setattr(runner.shutil, "which", lambda name: "/usr/bin/pier")
+    # Isolate the local config so deepseek_base_url() resolves deterministically
+    # (no config file on disk -> official endpoint by default).
+    from dradar import local_config
+
+    monkeypatch.setattr(local_config, "HOME", tmp_path)
+    monkeypatch.setattr(local_config, "CONFIG_PATH", tmp_path / "config.json")
     tasks = tmp_path / "tasks"
     (tasks / assignment["task_id"]).mkdir(parents=True)
     home = tmp_path / "home"
@@ -168,6 +174,40 @@ def test_command_uses_official_catalog_adapter_and_auth_without_secret_env(
     }
 
 
+def test_deepseek_endpoint_defaults_to_official(tmp_path: Path, monkeypatch):
+    from dradar import local_config
+
+    monkeypatch.setattr(local_config, "HOME", tmp_path)
+    monkeypatch.setattr(local_config, "CONFIG_PATH", tmp_path / "config.json")
+    assert providers.deepseek_base_url() == "https://api.deepseek.com/"
+
+
+def test_deepseek_endpoint_switches_to_opencode_go(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from dradar import local_config
+
+    monkeypatch.setattr(local_config, "HOME", tmp_path)
+    monkeypatch.setattr(local_config, "CONFIG_PATH", tmp_path / "config.json")
+    local_config._save_config({"deepseek_endpoint": "opencode-go"})
+    assert providers.deepseek_base_url() == "https://opencode.ai/zen/go/v1"
+
+    command, _ = _command(tmp_path, monkeypatch)
+    config_arg = next(
+        item for item in command if item.startswith("config_toml_file=")
+    )
+    parsed = tomllib.loads(Path(config_arg.split("=", 1)[1]).read_text())
+    assert parsed["model_providers"][DEEPSEEK_PROVIDER]["base_url"] == (
+        "https://opencode.ai/zen/go/v1"
+    )
+
+
+def test_deepseek_endpoint_rejects_unknown_value():
+    with pytest.raises(ValueError):
+        providers.deepseek_base_url("bogus")
+
+
 def test_deepseek_shared_inputs_are_reused_and_owner_only(
     tmp_path: Path,
     monkeypatch,
@@ -178,7 +218,7 @@ def test_deepseek_shared_inputs_are_reused_and_owner_only(
         home / runner.DEEPSEEK_AGENT_MODULE_FILENAME: (
             Path(runner.__file__).with_name("pier_deepseek.py").read_bytes()
         ),
-        home / "codex-deepseek-v4-flash.toml": runner.DEEPSEEK_TOML.encode(),
+        home / "codex-deepseek-v4-flash.toml": runner.deepseek_toml().encode(),
         home / "codex-submission-prompt.j2": (
             runner.CODEX_SUBMISSION_PROMPT.encode()
         ),
